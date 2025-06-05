@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#Copyright (c) Juan Manuel Cabo 2022 (juanmanuel.cabo@gmail.com, rockerito99@gmail.com)
 #checksum_db 0.3 by JMC - based on hash_db from https://github.com/mruffalo/hash-db
 #Creates, verifies and updates checksums to detect silent bit rot, file corruption,
 #hard drive errors, bad USB cable errors, verify copied directories, etc.
