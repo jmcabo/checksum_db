@@ -1,0 +1,2544 @@
+#!/usr/bin/env python3
+#checksum_db 0.3 by JMC - based on hash_db from https://github.com/mruffalo/hash-db
+#Creates, verifies and updates checksums to detect silent bit rot, file corruption,
+#hard drive errors, bad USB cable errors, verify copied directories, etc.
+#
+#
+#Usefulness:
+#     -Know what changed after an 'fsck' or 'chkdisk'.
+#     -Self check for bit rot of a whole USB flash drive backup with a single command
+#      (check unreliable, old, cheap, backup media).
+#     -Keep the checksums up to date after small changes without recomputing everything (ideal after rsync).
+#     -Compare whole directories by a single checksum ('dirsum').
+#     -Compare a list of directories by a single checksum each ('dirsum *') or any
+#      path or file inside the .json.
+#     -Compare whole directories with a list of individual changes (copy source .json to dest,
+#      then run 'status' and 'verify').
+#     -Be prepared against bad USB cables, bad SATA cables, loose connectors, a bad bit in computer RAM
+#      or the RAM inside a disk that is used for cache, power loss in the middle of writing,
+#      a failing PSU providing bad power, removing a USB drive without telling the OS to shut it
+#      down first, high drive operating temperatures, network instabilities during a transfer.
+#      SSD/Flash drive charge loss in a flash memory cell. Also DVD/Bluray optical media degradation.
+#      Also, SMR HDDs and QLC SSDs move your data multiple times after you have written it from their
+#      internal on-drive cache to other locations, and they self defrag when the drives are idle.
+#      That is an extra opportunity for data loss.
+#        With checksums you can detect silent data corruption and be able to do something about
+#      it before it is too late.
+#
+#Notes/FAQ:
+#     -Because floating point 'double's only have a precision of 15 to 16 significant digits
+#      that means that lstat() result st_mtime is limited to a precision from 0.1 to 1 microsecond for
+#      epochs of 10 integer digits (epochs since 2001).
+#      That means that ext4 full nanosecond precision won't be fully represented in the stored timestamps.
+#      NTFS precision, which is 0.1 microseconds, will not always be represented exactly.
+#      FAT32 and exFAT both have a precision of even seconds for modification timestamps, so that is no problem.
+#      (exFAT has 10ms resolution if files are created in Linux, but 2s resolution in Windows).
+#        There is a way to have the full resolution and that is to use 'st_mtime_ns' instead of 'st_mtime',
+#      the downside is that the numbers will be nanoseconds expressed as integers instead of
+#      floating point seconds since the epoch.
+#        The modification time is used in this program to save checksum recalculations when running
+#      the 'update' option. For reference, the well-known rsync tool will only compare integer seconds ignoring
+#      the fractional part. In both cases, a non-matching file size will force a recalculation/synchronization.
+#      The 'verify' option will always recompute the checksum independently of the timestamp.
+#      The 'status' option uses only the timestamp and size.
+#     -Files named like DB_FILENAME are skipped and never hashed, even if they are found in subdirectories.
+#     -It is recommended to uncheck "Preserve Modification Time" on software that mounts files as modifiable
+#      volumes. Otherwise it is hard to distinguish between bit rot and a legitimate modification of the
+#      file volume.
+#      Tip: Use 'checksum_db update --force [file|dir]' if the checksum changed but not the size or the
+#      timestamp, and you still want to bring the new changed checksum to the db.
+#      Tip: Mount those volume files as read-only when it isn't necessary to make modifications.
+#     -Symlinks: If a file is a symlink, it will get a HashEntryType.TYPE_SYMLINK in the DB. If the symlink
+#      works, the destination contents, size and modification time are used but the TYPE_SYMLINK is kept.
+#      If the symlink is broken, then the path string that it points to is hashed, the size is the symlink
+#      size (which is the length of the path without nul char), and the mtime of the symlink.
+#     -Broken symlinks make "sha1sum -c SHA1SUM" produce "No such file or directory" errors, and it
+#      returns 1 as exit code instead of 0, but working symlinks are fine and their contents are hashed.
+#     -When exporting to SHA1SUM, broken symlinks are also exported, but "sha1sum -c SHA1SUM" will error out on
+#      exported broken symlinks. Use "sha1sum --ignore-missing -c SHA1SUM" for those cases.
+#     -Permission denied dirs: They get printed to STDERR by on_walk_error and are skipped by walk(). Like "/lost+found" while
+#      running as a normal user.
+#     -Permission errors and other produced exceptions when trying to hash an inaccessible file don't crash the program.
+#      All hashing errors are printed to STDERR and they don't count towards the lists of Added, Removed and Modified.
+#      Files with read errors are not added nor updated nor verified, only reported. This avoids having to represent
+#      null hashes or a special HashEntryType.TYPE_ERROR for files with read errors, though that might be a good idea.
+#
+#Differences from hash_db:
+#Summary:
+#     -Selectable algorithm by DB (any in Python's hashlib)
+#     -Progress info with current/total MB and also speed in MB/s. Also now for init and update.
+#     -ModifyWindow option (and default) to handle FAT32/exFAT low mtime resolution, and less res of NTFS.
+#     -Path and DB selectable by options, useful to hash and check read-only mediums like mounted ro fs or DVD/BD.
+#     -verify/update/status of only a subset of files/dirs specified in the command line
+#     -Option to init as an empty DB to then be able to update (add) subdirs incrementally by specifying them in the cmdline.
+#     -Bugfixes for supporting DBs generated with '\\' path sep and then opened from Linux/Mac with '/'.
+#     -Symlink mode option (exclude, names, contents).
+#     -Import and verify a single MD5SUM/SHA*SUM file with -c. Very useful now that speed in MB/s is reported.
+#     -Support hashing the whole root fs:
+#         -Skip non-regular non-symlink files (block devices, fifos, sockets, special, etc.)
+#         -Option --xdev, --exclude-other-fs to skip devfs and procfs.
+#         -Permission errors don't crash the program and are informed (Same with OSError).
+#     -List of excluded paths addable to DB by --exclude option.
+#     -merge command (opposite of split).
+#     -dirsum command (single hash to represent a whole dir tree)
+#Details:
+#     -Renamed to "checksum_db" and "checksum_db.json"
+#     -Algorithm: Selectable algorithm (HashContext), it can be any algorithm offered by hashlib except the ones with
+#      variable digest size. For this feature, the file format Version was increased to 3. Old version 2 files with
+#      fixed SHA512 are supported.
+#     -Using faster SHA1 by default instead of SHA512. Didn't use MD5 because it could be
+#      blocked or missing from hashlib depending on implementation in the future.
+#      I consider SHA1 or even MD5 (or even CRC32) enough for data integrity checks.
+#      Even though MD5 and SHA1 are now considered weak, they are enough to detect hard
+#      drive bit rot. But I'm using SHA1 because of balance of speed and compatibility.
+#      Note: By testing in my i7, hashing 2 files that sum 1.6GB, I get:
+#            978MB/s for SHA1
+#            703MB/s for MD5
+#            662MB/s for SHA512
+#            461MB/s for SHA256
+#      that means that some algorithms are better optimized than others in python's hashlib.
+#     -Indented .json file instead of having everything in one line. This makes it possible
+#      to compare .json files with diff and vimdiff.
+#     -Added file 'count' field to .json.
+#     -modify-window of 1 second (ignore fractional part), otherwise everything gets
+#      rechecked when doing 'update' or 'status' after moving between ext4, NTFS and FAT32.
+#      Ext4 has nanosecond precision while NTFS has 0.1 microsecond precision.
+#      FAT32 and exFAT both have 2-second (even) resolution. (exFAT has 10ms resolution if files
+#      are created in Linux, but 2s resolution in Windows).
+#     -Show elapsed time for init, update and verify commands, with time and speed in MB/s.
+#     -Show progress for init and update (it already showed progress for verify).
+#     -Show progress in megabytes also, in addition to file count, for init, update and verify commands.
+#     -Don't show a stack trace when interrupting with CTRL+C (KeyboardInterrupt exception).
+#     -verify optimization: if the sizes don't match, fail that file and skip the checksum. (The modification times
+#      are still not being taken into account when verifying. Only the size and checksum).
+#      Not only this is quicker, but it also makes the possibility of a hash collision extremely difficult, if not
+#      impossible, by requiring the file to be the same size.
+#     -BugFix: Fix crash when doing 'export' and there was an entry with null/None hash in the DB (permissions problem, etc.).
+#     -dirsum command: Computes a hash representing a whole directory tree, or subdirectories and files.
+#      Useful for comparisons, and to dig in subdirectories to find the difference.
+#      The 'dirsumnow' command skips the DB and re-hashes the selected files.
+#     -Status of, Update or Verify only a subset of paths specified as arguments (dirs or individual files).
+#      Ideal for big filesystems of which one wants to verify or update a subdir.
+#     -exclude paths: For /var/tmp/ for instance. Or for a huge USB drive in which 20 subfolders matter but 2 or 3 don't.
+#     -exclude other fs: Option to skip other filesystems, USB drives, network mounts that could be found in subdirs.
+#      This allows to checksum the whole '/' root dir while skipping /dev, /proc, /run, etc.
+#     -update --force: This recalculates all checksums even if the file timestamp and size haven't changed.
+#      The output list of modified files is still only for those files that changed the checksum. It is like running
+#      init again, except that you can do it for a single file or directory specifying it in the command line, and
+#      except that you will get the list of changes (init would just reshow all files as Added).
+#     -BugFix: If there is a symlink pointing to an empty 0 byte file, then init and update crash.
+#     -BugFix: Symlink size and mtime doesn't match destination file contents. If the size or mtime of the symlink
+#      never changes, but the destination mtime did change, that would confuse 'update' and 'status'.
+#     -BugFix: Special files (socket, fifo, block devices) were being added with a null/None hash and they always
+#      showed up as Modified when running 'update' and 'status'. Now they are completely skipped. These types of files
+#      are often found in /run, /tmp and /dev.
+#     -BugFix: Permission errors produced exceptions when trying to hash an inaccessible file and crashed the program.
+#     -BugFix: Crash trying to read /dev/core or /proc/kcore. It shouldn't be checksummed. Fixed: Now it returns
+#      "OSError: [Errno 12] Cannot allocate memory" which is caught and displayed as: "Error adding file: OSError: /dev/core".
+#     -BugFix: Paths that represent directories or non-regular files were not being skipped in 'import'.
+#     -BugFix: Running in /tmp/ it produces hashes with None value that are stored in the json as null. Then 'status'
+#      shows those files as always Modified, and 'verify' shows them as always Removed. Doing 'export' produces a crash.
+#      The way that sha1sum and md5sum handle it, is by producing errors to STDERR and not writing anything about those.
+#     -merge subdir: Use case: One brings a subdir from a different directory into a directory that already
+#      has a DB. Then does a 'merge' command. It is the reverse of 'split'. All that to save recomputations.
+#     -mtimelocal written in ISO datetime format in .json. Just nice to have, for double checking and for grepping
+#      the json and making it more human readable. The 'mtimelocal' field is not read or used. Only 'mtime' is used.
+#     -BugFix: Crash when importing a SHA512SUM file that had a line with a hash but no filename.
+#     -Treat files with read errors (PermissionError, OSError, etc.) as Modified Files in the listing.
+#
+#Done:
+#     @editable default algorithm in checksum_db file.
+#     @Show --help when no arguments present.
+#     @init: Maybe it shouldn't pick the parent dir json. Sometimes one wants to re-init a subdirectory.
+#     @test with a whole filesystem '/' (dev, proc, sys special files, recursive symlink dirs,
+#      show progress files/time, permission errors, stay in same filesystem (don't go into mounted fs option?))
+#     @Fix transfer of mtime from ext4 to ntfs.
+#     @Make the modify-window a global variable default option, or a command-line argument.
+#     @Arg for path for checksum_db.json?  (useful when hashing RO directories, like a DVD or a RO system dir /usr/bin)
+#     @Arg for path to hash?  (useful when hashing several in succession, like from a batch list)
+#     @Not sure if this will spaguetify: Ability to specify path of .json for 'status', useful to compare a
+#      source and a dest dir without copying the json?. Maybe not call it 'status' but 'comparestatus'.
+#     @Test filenames with japanese characters in a modern Windows, because in WinXP they can't be imported from md5sums.txt
+#      and they produce errors when printing filenames to CP437 bash console of MingGW in WinXP.
+#     @Bug: Should dirsumnow read the algorithm and exclude_other_fs and exclude_paths from the found DB?
+#     @walk() doesn't completely skip enumeration of --exclude'd directories. If they are mounted in a network or USB or DVD, it will
+#      cause some network/USB/DVD I/O even if they are excluded. Must replace it with a custom walk() that accepts a directory filter function.
+#      The same with --exclude-other-fs, walk() it will still enumerate subdirs on different filesystems.
+#     @Bug: md5deep and jmbup files with windows slashes "\" instead of "/".
+#     @Support exporting filenames with '\\' and newlines: Write a backslash '\\' and use unicode_encode or
+#      raw_unicode_encode. Test with "sha1sum -c".
+#     @dirsum --now, to force a recalculation before giving the checksums.
+#     @Bug: Disable output colors when stdout is not isatty() (redirecting to file, etc.).
+#     @Bug: Disable output colors if they can't be made to work in Windows.
+#     @Bug: Reading in Linux a .json DB that was created in Windows is not possible. All paths show up as Removed
+#      when running 'verify'.
+#      In windows both '/' and '\\' are accepted as path separators. In Linux, the '\\' can be a valid char in a filename
+#      and is not automatically interpreted as '/'.
+#      In pathlib, Python specifies 'sep' and 'altsep' for Windows, but for Posix the 'altsep' is not specified.
+#      It can be possible to store the path separator in a field in the DB.
+#     @Bug: crash when the --db doesn't exist for verify/update/status, etc. For init/import it is OK if it doesn't exist, it will be created.
+#     @Bug: crash when the --dbimport doesn't exist.
+#     @Bug: crash when the DB can't be automatically found, i.e., 'checksum_db status' and no parent dirs have a db.
+#     @Bug: crash reading md5 file with tildes from STDIN: checksum_db --dbimport=- --path=. verify
+#     @Bug: crash when the argument to 'verify nodir/nofile' is a non existant subdirectory.
+#     @Bug: 'split' to an inaccessible subdirectory (permission error) produces a crash on save().
+#     @Bug: dirsum and dirsumnow return different results depending on os.sep. In Windows, with the same DB file, the result changes
+#      against the same DB file but read from Linux (if there are subdirs with files in the DB, so that the path sep is used in filenames).
+#      Both dirsum and dirsumnow return the same value at least, on the same system.
+#      This can be confusing if two systems access the same shared folder at the same time, they will give different dirsum if
+#      one is Windows and the other is not.
+#     @import/check in one action, with a different path:
+#            #checksum_db verifyfrom --db=cd9_md5.txt --path=/media/cdrom
+#            #checksum_db -c cd9_md5.txt --path=/media/cdrom
+#            #checksum_db --import=cd9_md5.txt --path=/media/cdrom
+#      Use case1: Check a digest file only:
+#            #checksum_db --import=cd9_md5.txt --path=/media/cdrom verify
+#            #checksum_db --import=cd9_md5.txt --path=/media/cdrom status
+#                 Verify a subdir or files only:
+#            #checksum_db --import=cd9_md5.txt --path=/media/cdrom verify soft/
+#            #checksum_db --import=cd9_md5.txt --path=/media/cdrom verify soft/myfile.zip other/otherfile.rar
+#                 Split a subset?:
+#            #checksum_db --import=cd9_md5.txt --path=/media/cdrom split --to-db=cd9_soft_checksum_db.json soft/
+#      Use case1b: Check a selection from STDIN (files ending in .iso):
+#            #cat cd9_md5.txt | grep '\.iso$' | checksum_db --dbimport=- --path=/media/cdrom verify
+#      Use case2: Create a checksum of a read only media, or dir that we don't wan't to modify:
+#            #checksum_db --db=cd10_checksum_db.json --path=/media/cdrom init
+#                 Recheck it later:
+#            #checksum_db --db=cd10_checksum_db.json --path=/media/cdrom verify
+#                 Update, maybe a file was deleted or renamed. Maybe timestamps are in a different timezone:
+#            #checksum_db --db=cd10_checksum_db.json --path=/media/cdrom update
+#      Use case3: Create checksum of system dirs, but don't write to '/':
+#            #checksum_db --db=system_checksum_db.json --path=/ init --exclude-other-fs --exclude=/home --exclude=/tmp --exclude=/var/tmp
+#            #checksum_db --db=home_checksum_db.json --path=/home/myuser init --exclude=/home/myuser/.cache
+#                 Verify later
+#            #checksum_db --db=system_checksum_db.json --path=/ verify
+#            #checksum_db --db=home_checksum_db.json --path=/home/myuser verify
+#
+#      Should the path be saved to the .json?
+#            Yes, and fail if not found later.
+#      What is the db when using --import=cd9_md5.txt?, to where does it save on 'update'?
+#      What happens if there is a checksum_db.json in the same directory? Or in a parent directory?
+#     @Bug: Don't automatically load a DB in a parent dir that has a base_path different than ".".
+#           (check self.dbfilename_is_auto)
+#     @Bug: Which DB to use automatically when --path is specified?
+#          The one in the current directory or found in its parent directory.
+#     @Bug: Don't search DB in parent directories for init and import.
+#     @init --exclude-other-fs --same-fs (-x init option)
+#     @algorithm md5 init option
+#     @import algorithm: md5sum, sha1sum, sha512sum
+#     @export algorithm: md5sum, sha1sum, sha512sum
+#     @init --empty (to update or merge subdirs one by one)
+#     @dirsumnow
+#     @checksum_db --quiet: Don't show progress messages.
+#     #dirsum: sort ignoring case, like "|sort".
+#     @merge (one arg subdir, opposite of split).
+#     @import --file=FILE --for-path=DIR  ?
+#     @init --exclude exact paths
+#     @import --exclude exact paths
+#     @on_walk_error: exclude paths
+#     @"--exclude-symlinks" to init, import, (dirsumnow?). Useful if there is a collection that references
+#      the same files in different categories, in which the categories are directories with symlinks.
+#     @Symlinks:
+#          -NTFS can have symlinks too.
+#          -Option to ignore completely, as if they were removed.
+#               Use case: recheck a SHA512SUM file without listing symlinks as 'Added Files'.
+#                         especially if the SHA512SUM was generated with "find -type f".
+#               --typef, --exclude-symlinks.
+#          -Option to only hash symlink destination filename.
+#               Use case: DB for a mounted filesystem different than the root fs,
+#                         or a filesystem that was copied into a subdirectory.
+#               -P,
+#               --hash-symlink-names
+#          -Option to hash symlink contents if it works, or symlink filename if broken (current default).
+#               -L, --dereference
+#               --hash-symlinks
+#               --se, --symlink-exclude
+#               --sn, --symlink-names
+#               --sc, --symlink-contents
+#      In other tools:
+#      du:    -L derreference symlinks: it lists size of destination but doesn't duplicate.
+#             -P don't follow symlinks (default).
+#             the last -L or -P option in the cmd line will be the one that counts.
+#      find:  it has -L and -P, and also -H
+#             it also has "-type f" and "-type l".
+#             With -L it descends into symlinks that are subdirs.
+#
+#
+#ToDo:
+#     -ToDo: Also 'dircount', 'dirsize' or all inside dirsum.
+#     -Output whether check failed due to metadata or checksum.
+#     -Filter verify output by only failed by checksum.
+#     -Show version in --help.
+#     -Show readme contents in --help.
+#     -size sum in header in bytes?
+#     -dirstat: A la WinDirStat or KDirStat: Show filecount and size of subdirs, files.
+#     -field 'algorithm: "md5"' in header --algorithm=sha1 --print-available-algorithms, etc.
+#     -think about standard output and greppeability. Maybe add a switch to stop progress messages,
+#      or a switch to not show all the filenames added/refreshed but instead show a total count.
+#      Or show added/removed/refreshed files with a prefix that is greppeable like +/-/*.
+#     -Perhaps test for writeability for the destination json file before checksumming the whole directory
+#      and failing with a permission error right at the end after all that.
+#      Either fail at the beginning, or if error write the json file to "/tmp/checksum_db_<tmpnam>.json" or
+#      interactively ask where to store it.
+#     -Return errorlevel when verify has mismatches, in case it makes sense to automate 'verify' it in a periodic cron job.
+#      Also return errorlevel if 'update' fails for some reason, permissions etc. missing start dir, in case it
+#      is also automated (ie: to add new files after a successful verify).
+#     -Display size of changes with 'status' as file count and MBytes. Added, removed and modified. Useful to know
+#      how long 'update' will take. Or to compare directories taking the .json from a source dir and placing it in dest.
+#     -Check why SURROGATE_ESCAPES is needed when printing filenames. It might be needed again for 'dirsum'
+#      which also prints filenames. And for permission error messages.
+#     -Option -0 or --print0 to output filenames delimited by '\0' instead of newline. But it would mean to have a different
+#      style of output, perhaps rclone or git style. The --print0 option is useful for filenames with spaces and newlines.
+#     -Windows: Test in windows. Both small subdirs and the whole C:\ partition.
+#     -verify paths: what to do with path args that are not present in the DB. Show error message?
+#     -rename 'subdirs' to 'subpaths'.
+#     -"Bit Rot Files:" or "Corrupted Files:"?. Maybe a new section instead of "Modified Files:" that lists checksum
+#      changes without size or mtime changes. Like the 'cshatags' program does.
+#     -Action to display DB info: algorithm, excluded paths, file count, sum size in bytes.
+#     -Ideal: A command to scan for NTFS incompatibilities. exFAT/Fat32 too, like duplicate file with different case.
+#               ls -lR | FindNonAscii --non-utf8
+#               find | grep '[?|:]'
+#      also filenames with '\' in Linux in the name.
+#      also check for newlines in filenames. In bash it is:
+#               find -name '*'$'\n''*'
+#     -'benchmark' command that tests all algorithms in perhaps RAM, or a supplied filename.
+#     -Help text for all commands.
+#     -Put Examples at the bottom of the help texts, like other popular commands.
+#     -PermissionError messages: Does it make sense to create a command line switch to hide those messages? And to
+#      return errorlevel=0? Or is it better to provide a way to exclude files and dirs, like an exclude paths array in the DB?
+#     -Bug: crash when the --path doesn't exist. Crashes at set_exclude_paths() in load() when the db has excluded paths.
+#           checksum_db --db fs_checksum_db.json --path asdf verify
+#     -Support hashdeep dbimport format.
+#     -Support rhash format (CRC32 after the filename?)
+#     -Support 'cksum' format? (CRC32 SIZE FILENAME), although it has a different CRC than zlib CRC.
+#     --
+#     -Test subdirs/subfiles outside of the db.path. For instance, 'update' shouldn't add those paths.
+#     -Bug: 'split' doesn't check if the argument is a parent directory and happily writes a .json there with the paths relativized-to.
+#     -Bug: 'dirsum' doesn't check if the argument is a parent directory and returns a checksum that is not useful, instead of an error.
+#     -Bug: It should be possible to checksum the whole '/' partition. I can think of a few uses, like before and after
+#      moving it to a different HDD in a bigger partition (ie: RAM bit flip errors while moving, SATA/USB cable errors).
+#      Or for verifying after storing for a long time.
+#      Use case: It should be possible to hash while using the partition, and then check it again from a live CD perhaps.
+#      and viceversa: hash while mounting from a live CD and then verify while using the partition.
+#      The Debian/Ubuntu command "debsums -a -s" is very useful for this but it only covers installed files.
+#     -Bug: Importing from SHA1SUM a line with a path that is outside the db.path, produces an exception in the relative_to() call when saving.
+#     -Bug: On merge, old paths that were there in the subdirectory should be removed before merging the new db.
+#      Use path_is_subpath_of() on each entry.
+#     -Bug: On merge, if a path is not a subpath of the top DB, and points outside, should that be an error?
+#     -Bug: 'export' doesn't work for CDROMS or read only media because it wants to write the SHA512SUM file to the base path.
+#     --
+#     -check if paths outside
+#     -?merge remove old.
+#     -fix overall MB/s when loading takes a long time, like with -c / --dbimport and slow encoding detection.
+#     -dirstat
+#     -dirstat --filter *.mp4
+#     -dirstat -b or -h
+#     -dirstatnow
+#     -listbytime, listbytimenow
+#     @duplicates
+#     -xxhash support
+#     -crc support
+#     -benchmark
+#     -export <dest>  (relative paths)
+#     -checksums.chksumdb: pick an extension. Autodetect both that extension and "hash_db.json".
+#     --
+#     next generation:
+#        -different cmdline parsing (allow 'st' instead of 'status', 'up instead of 'update')
+#        -jmbup format with nanosecond timestamps?
+#        -custom made progress bar with MB/s? And time remaining.
+#        -Hashing in blocks instead of one big mmap. Give progress on big multi gigabyte files.
+#        -maybe different output for the lists of files. What to do with color of titles.
+#        -unit tests (ie: don't crash with PermissionError, etc.) At least 10 tests, not necessary to test everything.
+#         The tests will expect a sistematizable output for lists of files. See what GIT and SVN do for parseable lists of changes.
+#         Unit tests are required to make it a well maintained program.
+#        -parse dir/s and lslr files?
+#
+#
+
+
+from argparse import ArgumentParser
+from enum import Enum
+from fnmatch import fnmatch
+import hashlib
+import json
+from mmap import mmap, ACCESS_READ
+from os import fsdecode, fsencode, chdir, getcwd, stat, lstat, readlink, stat_result
+from os.path import normpath
+import os
+from pathlib import Path
+from io import BytesIO
+import re
+from stat import S_ISLNK, S_ISREG
+from sys import stderr, stdout, stdin
+from time import time
+from datetime import datetime, timezone
+
+try:
+    from scandir import walk
+except ImportError:
+    from os import walk
+
+HAVE_CHARDET = True  #Please set this to False if opening imported SHA512SUM files is
+                     #too slow and encoding detection for those is not needed (all utf-8 or ascii files).
+try:
+    import chardet   #Used for example to import SHA512SUM files written in 'latin-1' with accents.
+except ImportError:
+    HAVE_CHARDET = False
+
+DB_FILENAME = 'checksum_db.json'
+EXPORT_FILENAME_TEMPLATE = '{$HASHNAME}SUM'  #Example: 'SHA1SUM'
+# fnmatch patterns, specifically:
+IMPORT_FILENAME_PATTERNS_TEMPLATE = [
+    DB_FILENAME,
+    '{$HASHNAME}SUM',       #Example: 'SHA256SUM'
+    '{$HASHNAME}SUM.asc',
+    '{$hashname}sum.txt',
+    '{$hashname}sums.txt',  #Example 'md5sums.txt'
+    '*.{$hashname}',        #Example: 'myfile.md5'
+    '*.{$hashname}sum',     #Example: 'myfile.sha256sum'
+    '*.{$hashname}sum.asc',
+    'DIGESTS',
+    'DIGESTS.asc'
+]
+DEFAULT_HASH_ALGORITHM = "sha1"
+POPULAR_ALGORITHMS_BY_HASH_LEN = {32: "md5", 40: "sha1", 56: "sha224", 64: "sha256",
+                                 72: "md5-sha1", 96: "sha384", 128: "sha512"}
+#Algorithms left out of automatic detection because they have same size:
+#    32: "md4", 40: "ripemd160", 56: "sha3_224", 56: "sha512_224", 64: "blake2s", 64: "sha3_256",
+#    64: "sha512_256", 64: "sm3", 96: "sha3_384", 128: "blake2b", 128: "sha3_512", 128: "whirlpool"
+
+SURROGATE_ESCAPES = re.compile(r'([\udc80-\udcff])')
+
+MODIFY_WINDOW = 1  #In seconds. Use negative for exact match of microseconds. Use 0 for matching whole seconds.
+                   #Use 1 to workaround FAT32, exFAT. Use 3600 to workaround systems with different DST. See "--modify-window".
+
+class SymlinkMode(Enum):
+    EXCLUDE = 0   #Skip symlinks as if they are not there. Like "find -type f".
+    NAMES = 1     #Hash only symlink destination names, i.e., the string of the target filename.
+                  #(useful for whole filesystem backups, for symlinks to absolute paths that loose
+                  #meaning when fs is mounted as as subdir.)
+    CONTENTS = 2  #Hash destination contents, and if a symlink is broken, hash only the destination name string.
+
+DEFAULT_SYMLINK_MODE = SymlinkMode.CONTENTS
+
+USE_COLORS = True
+if os.name == "nt" or not stdout.isatty():  #os.name can be: nt, posix or java
+    USE_COLORS = False
+ADDED_COLOR = '\033[01;32m'    if USE_COLORS else ""
+REMOVED_COLOR = '\033[01;34m'  if USE_COLORS else ""
+MODIFIED_COLOR = '\033[01;31m' if USE_COLORS else ""
+NO_COLOR = '\033[00m'          if USE_COLORS else ""
+
+# 1: 'version' field added
+# 2: entry 'type' field added; symlinks now treated correctly
+# 3: 'algorithm' field added
+DATABASE_VERSION = 3
+
+SHOW_PROGRESS_MSG = True
+PROGRESS_BYTES_READ_TOTAL = 0
+PROGRESS_START_TIME = time()
+PROGRESS_LAST_MSG_LENGTH = 0
+
+def progressMsg(s):
+    if SHOW_PROGRESS_MSG:
+        global PROGRESS_LAST_MSG_LENGTH
+        if len(s) < PROGRESS_LAST_MSG_LENGTH:
+            progressMsgClear()
+        stderr.write("\r" + s)
+        PROGRESS_LAST_MSG_LENGTH = len(s)
+
+def progressMsgClear():
+    if SHOW_PROGRESS_MSG:
+        global PROGRESS_LAST_MSG_LENGTH
+        if PROGRESS_LAST_MSG_LENGTH != 0:
+            stderr.write("\r" + " " * PROGRESS_LAST_MSG_LENGTH)
+
+def progressMsgNewLine():
+    if SHOW_PROGRESS_MSG:
+        global PROGRESS_LAST_MSG_LENGTH
+        PROGRESS_LAST_MSG_LENGTH = 0
+        stderr.write("\n")
+
+def accepted_algorithms():
+    accepted_hashes = []
+    for hash_name in hashlib.algorithms_available:
+        try:
+            hash_size = hashlib.new(hash_name).digest_size * 2
+        except ValueError:   #Note: Some unsupported algorithms are listed in algorithms_available,
+            continue         #but then fail on hashlib.new() with: "ValueError: unsupported hash type whirlpool"
+        if hash_size == 0:   #Skip variable length hash algorithms, not supported.
+            continue
+        accepted_hashes.append(hash_name);
+    return accepted_hashes
+
+def serialize_symlink_mode(symlink_mode):
+    if symlink_mode == SymlinkMode.EXCLUDE: return "exclude"
+    elif symlink_mode == SymlinkMode.NAMES: return "names"
+    elif symlink_mode == SymlinkMode.CONTENTS: return "contents"
+    raise Exception("Unknown symlink mode '{}'".format(symlink_mode))
+
+def deserialize_symlink_mode(mode_name):
+    if mode_name == "exclude": return SymlinkMode.EXCLUDE
+    elif mode_name == "names": return SymlinkMode.NAMES
+    elif mode_name == "contents": return SymlinkMode.CONTENTS
+    raise Exception("Unknown symlink mode name '{}'".format(mode_name))
+
+def find_hash_db_r(path: Path) -> Path:
+    """
+    Searches the given path and all of its parent
+    directories to find a filename matching DB_FILENAME
+    """
+    abs_path = path.absolute()
+    cur_path = abs_path / DB_FILENAME
+    if cur_path.is_file():
+        return cur_path
+    parent = abs_path.parent
+    if parent != abs_path:
+        return find_hash_db_r(parent)
+
+def find_hash_db(path: Path):
+    hash_db_path = find_hash_db_r(path)
+    if hash_db_path is None:
+        message = "Couldn't find '{}' in '{}' or any parent directories"
+        raise FileNotFoundError(message.format(DB_FILENAME, path))
+    return hash_db_path
+
+def split_path(path: Path):
+    """
+    :param path: Filesystem path
+    :return: path pieces
+    """
+    return path.parts[1:]
+
+def path_is_subpath_of(subpath: Path, parentpath: Path):
+    """
+    Returns True if 'sub_path' is under 'parent_path' or they are the same path.
+    Returns False otherwise.
+    It is the same as Path.is_relative_to() except that that function is not present in Python 3.8.
+    """
+    try:
+        subpath.relative_to(parentpath)
+        return True
+    except ValueError:
+        pass
+    return False
+
+def path_normpath(s):
+    """
+    The same as normpath but fixing its behavior of returning two leading slashes
+    under certain circumstances (os.path.normpath("//a//b/..//c/d//e") returns "//a/c/d/e"),
+    which is allowed in Posix but breaks some comparisons.
+    This function will return "/a/c/d/e" in the example.
+    Running 'checksum_db verify //path/to/dir' would break without this fix.
+
+    In POSIX having a leading double slash can have a special meaning, but it doesn't have a special
+    meaning in Linux.
+
+    NOTE: os.path.normpath will automatically convert '/' to '\\' in Windows (because Windows has
+    an altsep) but it will not convert '\\' to '/' in Linux (because it could then be a valid name
+    char not a path separator). Linux ext4 supports '\\' as a valid filename char, as part of the name.
+
+    Path.resolve() doesn't return two leading slashes but is not a direct replacement of normpath
+    because Path.resolve() goes to the FS to resolve symlinks.
+    """
+    s = normpath(s)
+    #Not the same: return normpath(s).replace('\\\\', '\\')
+    if len(s) >= 2 and s[0] == '/' and s[1] == '/':
+        return s[1:]
+    return s
+
+def sorted_paths_safe(paths):
+    """
+    Returning just:
+        sorted(paths)
+    will give different results across OSs.
+    The pathlib WindowsFlavour object specifies a case insensitive sorting for Path objects
+    (lower() returned by casefold()), while PosixFlavour specifies case sensitive sorting.
+
+    Instead, this must be used:
+        sorted(paths, key=str)
+    to ensure to always sort in a case-sensitive fashion across OS.
+
+    This is important so as to have the same dirsum hash and the same exported SUM file across
+    different OSs and different invocations (like for a shared folder accessed from Windows and Linux).
+
+    Note: If we wanted case insensitive sorting, we would have to do two passes, taking advantage
+    of the fact that sorted() is a stable sorting algorithm in Python (respects relative order for
+    files that result "equal"). The two passes (one case sensitive and the other case insensitive)
+    would be needed to have repeatable and predictable sorting for filenames that share the same
+    name but have letters in different case that coexist in the same directory. So "SHA1SUM.txt"
+    would always show up before "sha1sum.txt".
+    Fat32 doesn't allow two filenames differring only on case in the same directory, but ext4
+    and NTFS do.
+
+    Note: Even with case insensitive sorting, that would still not match what Linux "ls -la" and
+    Linux "sort" commands do regarding filenames with dots and other non alphanumeric characters.
+    Ie: With "ls -la" and "find | sort", the filenames with dots are intermingled with the rest
+    instead of coming first:
+            # find | sort
+            ./checksum_db.json
+            ./.sha1sum
+            ./sha1sum
+            ./SHA1SUm
+            ./SHA1SUM
+    Tip: You can use "find | LC_ALL=C sort" to have predictable results in Linux command line.
+    Or even "ls -a | LC_ALL=C sort | xargs ls -ldaU"
+    """
+    #Predictable case sensitive across OS's:
+    return sorted(paths, key=str)
+    #Uncomment for predictable case insensitive:
+    #  return sorted(sorted(paths, key=str), key=lambda p: str(p).lower())
+
+def file_object_is_empty_or_empty_line(f):
+    i = 0
+    for line in f:
+        i += 1
+        if i > 1:
+            break
+    f.seek(0)
+    if i == 0 or (i == 1 and len(line.rstrip()) == 0):
+        #Empty files and also files that consist of 1 empty line
+        #(as in empty file re-saved with an editor that always adds newlines).
+        return True
+    return False
+
+class HashContext:
+    def __init__(self, hash_name):
+        self.hash_name = hash_name
+        self.hash_length = hashlib.new(self.hash_name).digest_size * 2
+        self.empty_file_hash = hashlib.new(self.hash_name, b'').hexdigest()  #Example for SHA1: 'da39a3ee5e6b4b0d3255bfef95601890afd80709'
+        # Mostly used for importing from saved hash files:
+        self.hash_pattern = re.compile(r'^[0-9a-fA-F]{' + str(self.hash_length) + r'}$')
+
+    def hash_function(self, b=None):
+        if b is None:
+            return hashlib.new(self.hash_name)
+        return hashlib.new(self.hash_name, b)
+
+    def pad_to_hash_length(self, s):
+        if len(s) >= self.hash_length:
+            return s
+        return s + " " * (self.hash_length - len(s))
+
+    def filename_patterns(self):
+        list = []
+        hash_name_lower = self.hash_name.lower()
+        hash_name_upper = self.hash_name.upper()
+        for pattern in IMPORT_FILENAME_PATTERNS_TEMPLATE:
+            pattern = pattern.replace("{$hashname}", hash_name_lower)
+            pattern = pattern.replace("{$HASHNAME}", hash_name_upper)
+            list.append(pattern)
+        return list
+
+    def get_export_filename(self):
+        filename = EXPORT_FILENAME_TEMPLATE
+        filename = filename.replace("{$hashname}", self.hash_name.lower())
+        filename = filename.replace("{$HASHNAME}", self.hash_name.upper())
+        return filename
+
+class HashEntryType(Enum):
+    TYPE_FILE = 0
+    TYPE_SYMLINK = 1
+
+class HashEntry:
+    def __init__(self, filename, size=None, mtime=None, hash=None, type=None):
+        # In memory, "filename" should be an absolute Path
+        self.filename = filename
+        self.size = size
+        self.mtime = mtime
+        self.hash = hash
+        self.type = type
+
+    def __hash__(self):
+        return hash(self.filename)
+
+    def get_stat_and_type(filename: Path, sm: SymlinkMode):
+        """
+        Static method with the only way to get the stat or lstat used in this program.
+        If the file is a symlink, get the destination stat() (we want to hash the contents and have size and mtime
+        that match the contents).
+        If the symlink is broken, get the lstat().
+        The type returned is TYPE_SYMLINK for symlinksregardless of weather the link is broken or not.
+
+        Each stat() or lstat() call is I/O so we only make one call for regular files and two calls for symlinks.
+        Also, the calls to Path.is_file() or Path.is_symlink() use stat() and lstat() calls internally, so those
+        would be extra I/O too.
+        That is why the HashEntryType is returned in the same method.
+
+        Raises errors if the file doesn't exist (first lstat()), but not if the symlink is broken.
+        """
+        str_filename = str(filename)
+        s = lstat(str_filename)  #Stat without resolving symlinks
+        t = HashEntryType.TYPE_FILE
+        if S_ISLNK(s.st_mode):
+            t = HashEntryType.TYPE_SYMLINK
+            if sm == SymlinkMode.CONTENTS:
+                try:
+                    s = stat(str_filename)  #Stat symlink destination
+                except FileNotFoundError:
+                    pass  #Symlink is broken, keep the first 's' from lstat().
+                except PermissionError:
+                    #stderr.write('\rSymlink Permission Error: {}\n'.format(str_filename))
+                    pass  #Symlink is broken (points to a directory inaccessible by this
+                          #user, like "/var/cache/fwupdmgr" or several under /proc).
+                          #Keep the first 's' from lstat().
+        return s, t
+
+    def _hash_file_contents(self, file_size, hc: HashContext):
+        if file_size <= 0:   #Return empty hash because mmap() gives errors on 0 byte files.
+            return hc.empty_file_hash
+        with self.filename.open('rb') as f:
+            with mmap(f.fileno(), 0, access=ACCESS_READ) as m:
+                global PROGRESS_BYTES_READ_TOTAL
+                PROGRESS_BYTES_READ_TOTAL += file_size
+                return hc.hash_function(m).hexdigest()
+
+    def _hash_link_name(self, hc: HashContext):
+        target = readlink(str(self.filename))
+        return hc.hash_function(fsencode(target)).hexdigest()
+
+    def hash_file(self, hc: HashContext, sm: SymlinkMode):
+        s, t = HashEntry.get_stat_and_type(self.filename, sm)
+        if S_ISREG(s.st_mode):
+            return self._hash_file_contents(s.st_size, hc)
+        elif S_ISLNK(s.st_mode):
+            #Only for broken symlinks. For those, the hash of the pointed to filename string is taken,
+            #since no content can be read:
+            return self._hash_link_name(hc)
+        return None
+
+    def exists(self, sm: SymlinkMode):
+        #Equivalent to the following but with only one lstat() I/O call when not a symlink:
+        #   return self.filename.is_file() or self.filename.is_symlink()
+        try:
+            s, t = HashEntry.get_stat_and_type(self.filename, sm)
+            if not S_ISREG(s.st_mode) and (sm == SymlinkMode.EXCLUDE or not S_ISLNK(s.st_mode)): #Skip special files (block device, socket, etc).
+                return False
+        except (FileNotFoundError, PermissionError):
+            return False
+        return True
+
+    def verify(self, hc: HashContext, sm: SymlinkMode):
+        s, t = HashEntry.get_stat_and_type(self.filename, sm)
+        if S_ISREG(s.st_mode):
+            #Don't compute the checksum if the size changed:
+            if s.st_size != self.size:
+                return False
+            #Compare checksum:
+            h = self._hash_file_contents(s.st_size, hc)
+            return h == self.hash
+        elif S_ISLNK(s.st_mode):
+            #Only for broken symlinks. For those, the hash of the pointed to filename string is taken,
+            #since no content can be read:
+            h = self._hash_link_name(hc)
+            return h == self.hash
+        return False
+
+    def update_attrs(self, sm: SymlinkMode, s=None, t=None):
+        if s is None or t is None:
+            s, t = HashEntry.get_stat_and_type(self.filename, sm)
+        self.size, self.mtime = s.st_size, s.st_mtime
+        self.type = t
+
+    def update_type(self, sm: SymlinkMode):
+        try:
+            s, t = HashEntry.get_stat_and_type(self.filename, sm)
+        except (FileNotFoundError, PermissionError):
+            # Treat it as a file even if it's missing. This only occurs when
+            # importing from saved hashes.
+            t = HashEntryType.TYPE_FILE
+        self.type = t
+
+    def update(self, hc: HashContext, sm: SymlinkMode):
+        self.hash = self.hash_file(hc, sm)
+        #update_attrs() is called  _after_  hash_file(), in case there was an exception opening the
+        #file for hashing (PermissionError) and then the attributes would have to be rolled-back.
+        #See the _update_entries() loop for modified files.
+        self.update_attrs(sm)
+
+    #Comparator used only by _find_changes(), which in turn is used for 'init', 'update' and 'status'.
+    #
+    #The type is not always obtained from the st_mode of the same stat() or lstat() call, if it is a symlink,
+    #the type will be TYPE_SYMLINK but the stat() will belong to the destination of the link (we care about
+    #the size and mtime matching the link target contents). This is why using __eq__ against a single stat without
+    #the type was bringing problems, with symlinks and non-regular files like sockets and fifos.
+    def equalsActual(self, deststat, thetype):
+        return (
+            self.size == deststat.st_size
+            and self.type == thetype
+            and self.mtime is not None
+            #Default Modify-window of 1 second (ignore fractional part, use 2s resolution). Use -1 for a
+            #perfect match.
+            #The tolerance is there to avoid having everything get rechecked when doing 'update' or marked
+            #as Modified File in 'status' after moving between ext4 and ntfs (fractional mismatch) or between
+            #FAT32/exFAT (1s difference).
+            #Ext4 has nanosecond precision while NTFS has 0.1 microsecond precision.
+            #Fat32 and exFat have 2-second, even, precision (max 1s difference).
+            #(exFAT has 10ms resolution for exFAT files that are created in Linux, but 2s resolution in Windows).
+            #See --modify-window help text and see rsync man page which has the same option.
+            and (abs(int(self.mtime) - int(deststat.st_mtime)) <= MODIFY_WINDOW  #Ignore fractional part and work around filesystems precision.
+                 or self.mtime == deststat.st_mtime)                             #Or match the exact fractional seconds when MODIFY_WINDOW is negative.
+        )
+
+class HashSumFormatError(Exception):
+    def __init__(self, message):
+        self.message = message
+
+#Base class for checksum formats that can be parsed and imported.
+class HashSumFormat:
+    def __init__(self):
+        self.encoding = None
+
+    def name(self): pass
+    def matches_format(self, f): pass
+    def parse(self, f, base_path): pass
+    def get_parsed_algorithm(self): pass
+
+    def set_encoding(self, enc):
+        self.encoding = enc
+
+    def detect_encoding(f):
+        """
+        Static method to detect the encoding for the imported hash sum file.
+        It is slow, call it only once per file.
+        """
+        #return "latin-1"
+        #return "utf-8"
+        enc = None  #If enc remains as None, then fsdecode() will be used, which is utf-8
+                    #in Linux and modern Windows, but can be like cp437 in old Windows XP.
+        if HAVE_CHARDET:
+            r = None
+            stderr.write("Detecting encoding... ")
+            stderr.flush()
+            r = chardet.detect(f.read())  #(Very slow, enc can be hardcoded to None or e.g. 'latin-1' if desired to bypass.)
+            if r is not None and "encoding" in r:
+                enc = r["encoding"]       #Can be None, for instance if file is empty.
+            stderr.write("{}\n".format(enc))
+        return enc
+
+    def decode_line(self, line):
+        if len(line) > 0 and line[0] == ord(b'\\'):   #The line starts with a backslash before the hash, that means that
+            line = line[1:].decode("unicode_escape")  #the filename is escaped because it contains newlines \n or backslashes \\.
+        else:
+            try:
+                #line = line.decode("latin1")
+                if self.encoding is not None:
+                    line = line.decode(self.encoding)
+                else:
+                    line = fsdecode(line)
+            except UnicodeDecodeError:
+                line = line.decode("unicode_escape")  #Reading a latin1 sequence stored in WinXP, from Win7, that is UTF-8 invalid.
+        return line
+
+    def detect_path_char_in_sum_file(self, f):
+        #Determine whether to use / or \ for reading paths in hash sum files.
+        #Reads the first 20 lines and counts which one is used more. If a '\' comes
+        #before a space, it is not counted because it works as a escape char then.
+        MAX_DETECTION_LINES = 20
+        unix_count = 0
+        win_count = 0
+        line_count = 0
+        for line in f:
+            if len(line) > 0 and line[0] == ord(b'\\'):   #The line starts with a backslash before the hash.
+                continue                                  #That means that the filename contains escape sequences
+            line = self.decode_line(line)
+            line_count += 1
+            if line_count > MAX_DETECTION_LINES:
+                break
+            i = 0
+            while i < len(line):
+                ch = line[i]
+                nextCh = line[i+1] if i != len(line)-1 else '\0'
+                if ch == '/':
+                    unix_count += 1
+                elif ch == '\\' and nextCh != ' ':
+                    win_count += 1
+                i += 1
+        if unix_count == 0 and win_count == 0:
+            return os.sep
+        elif unix_count > win_count:
+            return '/'
+        return '\\'
+
+
+#The format of md5sum, sha1sum, sha256sum, sha512sum, etc. Example:
+#0333e2fdd350a9ebac83fed8f424d3e6  test.txt
+#It is simply a hash, two spaces, and the rest of the line is the filename.
+#If there is a newline, then the line starts with a slash and the newline is represented as \\n
+#\f422d1111ec4c2a18f81bc13ddb0dae97867358f  aaaa\naaaa
+class SimpleSumFormat(HashSumFormat):
+    def __init__(self):
+        self.algo = None
+
+    def name(self):
+        return "simple"
+
+    def get_parsed_algorithm(self):
+        return self.algo
+
+    def _detect_algorithm(self, f):
+        hash_chars_pattern = re.compile(r'^[0-9a-fA-F]*$')
+        MAX_LINES = 3
+        i = 0
+        for line in f:
+            i += 1
+            if i > MAX_LINES:
+                break
+            line = self.decode_line(line)
+            #Split by double space, then analyze the first piece for hash chars and popular lengths:
+            pieces = line.strip().split('  ', 1)
+            if len(pieces) < 2:
+                continue
+            h = pieces[0]
+            if hash_chars_pattern.match(h) and len(h) in POPULAR_ALGORITHMS_BY_HASH_LEN:
+                algo = POPULAR_ALGORITHMS_BY_HASH_LEN[len(h)]
+                return algo
+        return None
+
+    def matches_format(self, f):
+        self.algo = self._detect_algorithm(f)
+        if self.algo is None:
+            return False
+        return True
+
+    def parse(self, f, base_path):
+        entries = {}
+        self.algo = self._detect_algorithm(f)
+        f.seek(0)  #Rewind after detecting algorithm.
+        if self.algo is None:
+            raise HashSumFormatError("Couldn't determine algorithm in input file.")
+        path_char = self.detect_path_char_in_sum_file(f)
+        f.seek(0)  #Rewind after detecting path char.
+        hash_length = hashlib.new(self.algo).digest_size * 2
+        hash_pattern = re.compile(r'^[0-9a-fA-F]{' + str(hash_length) + r'}$')
+        for line in f:
+            line = self.decode_line(line)
+            pieces = line.strip().split('  ', 1)
+            if len(pieces) < 2:
+                continue
+            if not hash_pattern.match(pieces[0]):
+                continue
+            file_hash = pieces[0]
+            filename = pieces[1]
+            if os.sep == '/' and path_char == '\\':
+                filename = filename.replace(path_char, os.sep)
+            filename = path_normpath(filename)
+            file_path = (base_path / filename).absolute()
+            entry = HashEntry(file_path)
+            entry.hash = file_hash
+            entries[file_path] = entry
+        return entries
+
+#Format produced by "md5deep -z" or passing '-z' to any of md5deep, sha1deep, sha256deep,
+#tigerdeep and whirlpooldeep to include the size field.
+#Consists of 10 digits for the size, two spaces, then the hash, two spaces, and the filename. Example:
+#        14  2093d13d3a7ced3cb6be40ae0e9181ce  aaa
+#The maximum size it supports is 9999999999 which is about 9.3GB. The size is left padded
+#up to 10 digits with spaces.
+#Note that the 'tiger' algorithm of tigerdeep is not supported by Python's hashlib.
+class Md5DeepFormat(HashSumFormat):
+    def __init__(self):
+        self.algo = None
+
+    def name(self):
+        return "md5deep"
+
+    def get_parsed_algorithm(self):
+        return self.algo
+
+    def _detect_algorithm(self, f):
+        line_pattern = re.compile(r'^[ 0-9]{9}[0-9]  [0-9a-fA-F]+  .+$')
+        hash_chars_pattern = re.compile(r'^[0-9a-fA-F]*$')
+        MAX_LINES = 3
+        i = 0
+        for line in f:
+            i += 1
+            if i > MAX_LINES:
+                break
+            str_line = self.decode_line(line)
+            if not line_pattern.match(str_line):
+                continue
+            #Split by double space, then analyze the first piece for hash chars and popular lengths:
+            pieces = str_line.strip().split('  ', 2)
+            if len(pieces) < 3:
+                continue
+            size = pieces[0]
+            h = pieces[1]
+            if hash_chars_pattern.match(h):
+                if len(h) == 128:
+                    return "whirlpool"  #whirlpool instead of sha512 since there is
+                                        #a whirlpooldeep but no sha512deep.
+                if len(h) in POPULAR_ALGORITHMS_BY_HASH_LEN:
+                    algo = POPULAR_ALGORITHMS_BY_HASH_LEN[len(h)]
+                    return algo
+        return None
+
+    def matches_format(self, f):
+        self.algo = self._detect_algorithm(f)
+        if self.algo is None:
+            return False
+        return True
+
+    def parse(self, f, base_path):
+        entries = {}
+        self.algo = self._detect_algorithm(f)
+        f.seek(0)  #Rewind after detecting algorithm.
+        if self.algo is None:
+            raise HashSumFormatError("Couldn't determine algorithm in input file.")
+        path_char = self.detect_path_char_in_sum_file(f)
+        f.seek(0)  #Rewind after detecting path char.
+        hash_length = hashlib.new(self.algo).digest_size * 2
+        hash_pattern = re.compile(r'^[0-9a-fA-F]{' + str(hash_length) + r'}$')
+        line_pattern = re.compile(r'^[ 0-9]{9}[0-9]  [0-9a-fA-F]+  .+$')
+        for line in f:
+            str_line = self.decode_line(line)
+            if not line_pattern.match(str_line):
+                continue
+            pieces = str_line.strip().split('  ', 2)
+            if len(pieces) < 3:
+                continue
+            if not hash_pattern.match(pieces[1]):
+                continue
+            size = int(pieces[0])
+            file_hash = pieces[1]
+            filename = pieces[2]
+            if os.sep == '/' and path_char == '\\':
+                filename = filename.replace(path_char, os.sep)
+            filename = path_normpath(filename)
+            file_path = (base_path / filename).absolute()
+            entry = HashEntry(file_path)
+            entry.hash = file_hash
+            entry.size = size
+            entries[file_path] = entry
+        return entries
+
+#Format produced by my (JMC's) old Java checksumming tool "JMBup". Example:
+#   13458449 1111405efa166eeea2683cd57d17d04e 2022-07-11 22:35:17.000 test
+#Directories are represented with a "<DIR>" string for the size field and spaces instead of a hash:
+#      <DIR>                                  2022-07-11 22:35:23.000 abc
+#The format consists of the fields "size hash date filename" with each field separated by a single space.
+#The size field is left padded with spaces up to 11 chars and can represent up to 99999999999 bytes
+#which is about 93.1GB. The modification time is expressed in local time (not UTC), up to
+#millisecond precision with 3 fixed decimal places for the seconds.
+class JMBupFormat(HashSumFormat):
+    def __init__(self):
+        self.algo = None
+
+    def name(self):
+        return "jmbup"
+
+    def get_parsed_algorithm(self):
+        return self.algo
+
+    def _detect_algorithm(self, f):
+        line_pattern = re.compile(r'^[ 0-9]{10}[0-9] [0-9a-fA-F]+ [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3} .+$')
+        dir_pattern = re.compile(r'^      <DIR> [ ]+ [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3} .+$')
+        hash_chars_pattern = re.compile(r'^[0-9a-fA-F]*$')
+        MAX_LINES = 3
+        i = 0
+        for line in f:
+            str_line = self.decode_line(line)
+            if dir_pattern.match(str_line):
+                continue
+            i += 1
+            if i > MAX_LINES:
+                break
+            if not line_pattern.match(str_line):
+                continue
+            #Split by double space, then analyze the first piece for hash chars and popular lengths:
+            pieces = str_line.strip().split(' ', 4)
+            if len(pieces) < 5:
+                continue
+            h = pieces[1]
+            if hash_chars_pattern.match(h) and len(h) in POPULAR_ALGORITHMS_BY_HASH_LEN:
+                algo = POPULAR_ALGORITHMS_BY_HASH_LEN[len(h)]
+                return algo
+        return None
+
+    def matches_format(self, f):
+        self.algo = self._detect_algorithm(f)
+        if self.algo is None:
+            return False
+        return True
+
+    def parse(self, f, base_path):
+        entries = {}
+        self.algo = self._detect_algorithm(f)
+        f.seek(0)  #Rewind after detecting algorithm.
+        if self.algo is None:
+            raise HashSumFormatError("Couldn't determine algorithm in input file.")
+        path_char = self.detect_path_char_in_sum_file(f)
+        f.seek(0)  #Rewind after detecting path char.
+        hash_length = hashlib.new(self.algo).digest_size * 2
+        hash_pattern = re.compile(r'^[0-9a-fA-F]{' + str(hash_length) + r'}$')
+        line_pattern = re.compile(r'^[ 0-9]{10}[0-9] [0-9a-fA-F]+ [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3} .+$')
+        dir_pattern = re.compile(r'^      <DIR> [ ]+ [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3} .+$')
+        for line in f:
+            str_line = self.decode_line(line)
+            if dir_pattern.match(str_line):  #Skipping dir entries (checksum_db doesn't store timestamps of directories.)
+                continue
+            if not line_pattern.match(str_line):
+                continue
+            pieces = str_line.strip().split(' ', 4)
+            if len(pieces) < 5:
+                continue
+            if not hash_pattern.match(pieces[1]):
+                continue
+            size = int(pieces[0])
+            file_hash = pieces[1]
+            datepart = pieces[2]
+            timepart = pieces[3]
+            dt = datetime(
+                int(datepart[0:4]), int(datepart[5:7]), int(datepart[8:11]),  #2022-07-11
+                int(timepart[0:2]), int(timepart[3:5]), int(timepart[6:8]),   #22:35:23.012
+                int(timepart[9:12]) * 1000  #it expects microseconds
+            )
+            filename = pieces[4]
+            if os.sep == '/' and path_char == '\\':
+                filename = filename.replace(path_char, os.sep)
+            filename = path_normpath(filename)
+            file_path = (base_path / filename).absolute()
+            entry = HashEntry(file_path)
+            entry.hash = file_hash
+            entry.size = size
+            entry.mtime = dt.timestamp()
+            entries[file_path] = entry
+        return entries
+
+AVAILABLE_FORMATS = [
+    SimpleSumFormat(),
+    Md5DeepFormat(),
+    JMBupFormat(),
+]
+
+def fix_symlinks(db):
+    for entry in db.entries.values():
+        if entry.type is None:
+            entry.update_type(db.symlink_mode)
+            if entry.type == HashEntryType.TYPE_SYMLINK:
+                entry.update(db.hc, db.symlink_mode)
+
+def fix_algorithm_and_symlink_mode(db):
+    if len(db.entries) == 0:
+        db.set_algorithm(DEFAULT_HASH_ALGORITHM)
+    else:
+        for entry in db.entries.values():
+            if entry.hash is not None:
+                if len(entry.hash) in POPULAR_ALGORITHMS_BY_HASH_LEN:
+                    algo = POPULAR_ALGORITHMS_BY_HASH_LEN[len(entry.hash)]
+                    db.set_algorithm(algo)
+                break
+    if not db.symlink_mode_is_forced:
+        db.symlink_mode = SymlinkMode.CONTENTS  #It was the symlink mode of version 2.
+
+# Intended usage: at version i, you need to run all
+# upgrade functions in range(i, DATABASE_VERSION)
+db_upgrades = [
+    None,
+    fix_symlinks,
+    fix_algorithm_and_symlink_mode,
+]
+
+class MergeHashDatabaseError(Exception):
+    def __init__(self, message):
+        self.message = message
+
+class LoadHashDatabaseError(Exception):
+    def __init__(self, message):
+        self.message = message
+
+class SaveHashDatabaseError(Exception):
+    def __init__(self, message):
+        self.message = message
+
+class ImportHashDatabaseError(Exception):
+    def __init__(self, message):
+        self.message = message
+
+class HashDatabase:
+    def __init__(self, path:Path=None, dbfilename=None, symlink_mode:SymlinkMode=None):
+        """
+        Creates a DB object.
+
+        The 'path' argument specifies the directory to checksum recursively, the directory to
+        which the entries in this database are relative to.
+        The 'dbfilename' points to where to read or store the json file for the DB.
+
+        If the base 'path' is not specified, then the current working directory is assumed and a flag
+        is set to indicate that the path was not forced. In that case, on db.load() it can change
+        to an autodetected path or the path stored inside the DB in the 'base_path' json field.
+
+        The dbfilename can be left unspecified, in which case db.load() will try to autodetect it by
+        looking in the current working directory and its parent directories.
+        """
+        if path is None:
+            self.path_is_forced = False
+            self.path = Path(getcwd())    #Assume current directory (until true path is loaded from inside the DB)
+        else:
+            self.path_is_forced = True
+            self.path = path
+        self.dbfilename = dbfilename   #It can be None, in that case it will be auto detected in load()
+        self.entries = {}
+        self.version = DATABASE_VERSION
+        self.algorithm = None
+        self.exclude_other_fs = False
+        self.exclude_paths = []
+        self.hc = None
+        self.set_algorithm(DEFAULT_HASH_ALGORITHM)
+        if self.path.exists():
+            self.path_fs = self.path.stat().st_dev
+        if symlink_mode is None:
+            self.symlink_mode_is_forced = False
+            self.symlink_mode = DEFAULT_SYMLINK_MODE
+        else:
+            self.symlink_mode_is_forced = True
+            self.symlink_mode = symlink_mode
+
+    def set_algorithm(self, algo):
+        if self.algorithm != algo:
+            self.algorithm = algo
+            self.hc = HashContext(self.algorithm)
+
+    def set_exclude_paths(self, paths):
+        self.exclude_paths = []
+        if paths is None or len(paths) == 0:
+            return
+        old_dir = getcwd()
+        #Make all exclude_paths absolute paths while in memory (assuming relative to the db.path):
+        try:
+            chdir(str(self.path))
+            for p in paths:
+                ep = Path(p).absolute()
+                if path_is_subpath_of(ep, self.path):  #Filter paths outside self.path
+                    self.exclude_paths.append(ep)
+            self.exclude_paths = sorted_paths_safe(self.exclude_paths)
+        finally:
+            chdir(old_dir)
+
+    def add_exclude_paths_from_db(self, other_db):
+        if len(other_db.exclude_paths) == 0:
+            return
+        #Assume the paths from other_db are already absolute paths.
+        #Remove duplicates and non relative paths:
+        all_paths = set()
+        for ep in other_db.exclude_paths:
+            if path_is_subpath_of(ep, self.path):  #Filter paths outside self.path
+                all_paths.add(ep)
+        for ep in self.exclude_paths:
+            all_paths.add(ep)
+        self.exclude_paths = sorted_paths_safe(list(all_paths))
+
+    def save(self, toStdOut=False):
+        filename = self.dbfilename
+        if filename is None:
+            filename = self.path / DB_FILENAME
+        #Write path as relative to the DB filename, otherwise as absolute:
+        base_path = self.path.absolute()
+        if path_is_subpath_of(base_path, filename.parent):
+            base_path = base_path.relative_to(filename.parent)
+        data = {
+            'about': "checksum_db - Detect file storage errors",  #Written but not read back.
+            'version': self.version,
+            'algorithm': self.algorithm,
+            'base_path': str(base_path),
+            'count': len(self.entries),  #Written but not read back.
+            'do_symlinks': serialize_symlink_mode(self.symlink_mode),
+            'exclude_other_fs': self.exclude_other_fs,
+            'exclude_paths': [str(ep.relative_to(self.path)) for ep in self.exclude_paths],
+            'path_sep': os.sep,          #When saving in Windows and reading from Linux, this indicates that '\\' must be converted to '/'.
+                                         #There are files in ext4 that have '\\' as a character, as can be found via: find -name '*\\*'
+            'files': {
+                str(entry.filename.relative_to(self.path)): {
+                    'size': entry.size,
+                    'mtime': entry.mtime,
+                    'mtimelocal': datetime.fromtimestamp(entry.mtime).isoformat()  #Written but not read back. Only 'mtime' is read.
+                                    if entry.mtime is not None else None,          #It has up to microsecond precision and is in local time.
+                    'hash': entry.hash,
+                    'type': entry.type.value,
+                }
+                for entry in self.entries.values()
+            }
+        }
+        if toStdOut:
+            json.dump(data, stdout, ensure_ascii=False, sort_keys=True, indent=4)
+            stdout.write("\n")  #Newline not necessary but for pretty printing
+        else:
+            try:
+                with filename.open('w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, sort_keys=True, indent=4)
+                    f.write("\n")  #Newline not necessary but for pretty printing
+            except (OSError, PermissionError) as e:  #Note: OSError happens with a read-only filesystem.
+                raise SaveHashDatabaseError("Error saving DB: {}".format(str(e)))
+
+    def find_external_hash_files(self, path: Path):
+        filename_patterns = self.hc.filename_patterns()
+        for dirpath_str, dirs, filenames in walk(str(path), topdown=True, onerror=self._on_walk_error):
+            dirpath = Path(dirpath_str).absolute()
+            dirs[:] = [d for d in dirs if not self._must_exclude_dir(dirpath / d)]  #Don't walk down into excluded subdirs.
+            if self._must_exclude_dir(dirpath):
+                continue
+            for filename in filenames:
+                abs_filename = (dirpath / filename).absolute()
+                if self._must_exclude_path(abs_filename):
+                    continue
+                if any(fnmatch(filename, pattern) for pattern in filename_patterns):
+                    abs_filename = dirpath / filename
+                    if self.exclude_other_fs:
+                        if self.path_fs != abs_filename.stat().st_dev:
+                            continue
+                    yield abs_filename
+
+    def dump(self):
+        self.save(True)
+
+    def split(self, subdir: Path):
+        if subdir.is_file():
+            raise NotADirectoryError(subdir)
+        subdir = subdir.absolute()
+        #Create DB object:
+        copy = HashDatabase(self.path)
+        copy.path = subdir
+        copy.set_algorithm(self.algorithm)
+        copy.set_exclude_paths(self.exclude_paths)
+        copy.exclude_other_fs = self.exclude_other_fs
+        copy.path_fs = self.path_fs   #Must use xdev of parent DB dir (ie: 'status /*' on whole system DB):  #copy.path.stat().st_dev
+        copy.symlink_mode = self.symlink_mode
+        pieces = split_path(subdir)
+        prefix_len = len(pieces)
+        #Filter each entry:
+        for path, item in self.entries.items():
+            entry_path_pieces = split_path(path)
+            if pieces[:prefix_len] == entry_path_pieces[:prefix_len]:
+                copy.entries[path] = item
+        return copy
+
+    def split_single_file(self, subfile: Path):
+        if subfile.is_dir():
+            raise IsADirectoryError(subdir)
+        subfile = subfile.absolute()
+        copy = HashDatabase(self.path)
+        copy.path = subfile.parent
+        copy.set_algorithm(self.algorithm)
+        copy.set_exclude_paths(self.exclude_paths)
+        copy.exclude_other_fs = self.exclude_other_fs
+        copy.path_fs = self.path_fs   #Must use xdev of parent DB dir (ie: 'status /*' on whole system DB):  #copy.path.stat().st_dev
+        copy.symlink_mode = self.symlink_mode
+        if subfile in self.entries:
+            copy.entries[subfile] = self.entries[subfile]
+        return copy
+
+    def load(self):
+        #Determine filename:
+        automatic_filename = False
+        if self.dbfilename is None:
+            #Automatically find in parent directories of the CWD current working directory:
+            automatic_filename = True
+            try:
+                self.dbfilename = find_hash_db(Path(getcwd()))
+            except FileNotFoundError as e:
+                raise LoadHashDatabaseError("Error loading DB: {}".format(str(e)))
+            if not self.path_is_forced:
+                self.path = self.dbfilename.parent  #Use the path of the .json if --path not specified
+            if Path(getcwd()) != self.dbfilename.parent:
+                stderr.write("Found DB at '{}'\n".format(str(self.dbfilename)))
+        #Read json:
+        try:
+            with self.dbfilename.open(encoding='utf-8') as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            raise LoadHashDatabaseError("Error loading DB: File not found '{}'".format(str(self.dbfilename)))
+        #Use saved base_path as self.path if it wasn't forced (if it wasn't specified with --path)
+        if not self.path_is_forced and 'base_path' in data:  #This field appeared in version 3.
+            old_dir = getcwd()
+            try:
+                chdir(str(self.dbfilename.parent))  #base_path is relative to the .json
+                self.path = Path(data['base_path']).absolute()
+            finally:
+                chdir(old_dir)
+        #Error if the DB was found automatically in a parent dir but the base_path of the db does not cover the current dir:
+        if (automatic_filename
+            and not path_is_subpath_of(Path(getcwd()), self.path)):
+            #and Path(getcwd()).absolute() != self.dbfilename.parent.absolute()):
+            raise LoadHashDatabaseError("Error loading DB: current directory is not part of the DB found "
+                    "automatically in a parent directory at '{}'. DB start path '{}'. Specify the DB with --db or change its "
+                    "start --path.".format(str(self.dbfilename), str(self.path)))
+        if self.path.exists():
+            self.path_fs = self.path.stat().st_dev
+        self.version = data['version']
+        if 'algorithm' in data:  #This field appeared in version 3.
+            self.set_algorithm(data['algorithm'])
+        if 'exclude_paths' in data:  #This field appeared in version 3.
+            self.set_exclude_paths(data['exclude_paths'])
+        if 'exclude_other_fs' in data:  #This field appeared in version 3.
+            self.exclude_other_fs = data['exclude_other_fs']
+        if not self.symlink_mode_is_forced and 'do_symlinks' in data:  #This field appeared in version 3.
+            self.symlink_mode = deserialize_symlink_mode(data['do_symlinks'])
+        path_sep = os.sep
+        if 'path_sep' in data:  #This field appeared in version 3.
+            path_sep = data['path_sep']
+        for filename, entry_data in data['files'].items():
+            if path_sep == '\\' and os.sep == '/':
+                #The DB file was saved in Windows and is being read in Linux/Mac, etc. Do the conversion. Because Path() and
+                #normpath() won't convert in this direction, from '\\' to '/', in Posix.
+                #Don't do the other way around since Windows already has altsep='/', and '\\' is a valid char for a filename in Linux.
+                filename = filename.replace('\\', '/')
+            entry = HashEntry((self.path / filename).absolute())
+            entry.size = entry_data.get('size')
+            entry.mtime = entry_data.get('mtime')
+            entry.hash = entry_data.get('hash')
+            entry.type = HashEntryType(entry_data.get('type'))
+            if self.symlink_mode == SymlinkMode.EXCLUDE and entry.type == HashEntryType.TYPE_SYMLINK and self.version != 2:
+                continue  #Skip loading of symlinks if they are now being excluded.
+            self.entries[entry.filename] = entry
+        for i in range(self.version, DATABASE_VERSION):
+            db_upgrades[i](self)
+        self.version = DATABASE_VERSION
+
+    def ensure_base_path_exists(self):
+        if not self.path.is_dir():
+            raise LoadHashDatabaseError("Error loading DB: Base path doesn't exist '{}' for DB '{}'. "
+                    "Use a different --path or edit 'base_path' in the .json.".format(str(self.path), str(self.dbfilename)))
+
+    def _read_checksums(self, import_filename, hashes_base_path):
+        """
+        Returns entries with hash and filename. The entries will have size and mtime
+        also, depending on the format of the imported file, which is autodetected.
+        """
+        new_entries = {}
+        algo = None
+        #Open input:
+        if str(import_filename) == "-":
+            #Read all of stdin to a seekable memory file:
+            #Note: Can't use "BytesIO(fsencode(stdin.read()))" because that produces UnicodeDecodeError errors with
+            #latin-1 files with accents, and in those cases piping through "iconv -f ISO-8859-1 -t UTF-8" was necessary.
+            f = BytesIO(stdin.buffer.read())
+        else:
+            f = import_filename.open('rb')
+        with f:
+            if not file_object_is_empty_or_empty_line(f):
+                #Detect encoding (fixes problems with accents in filenames encoded in Latin1 files generated from old Windows)
+                enc = HashSumFormat.detect_encoding(f)
+                #Detect format:
+                formatparser = None
+                for parser in AVAILABLE_FORMATS:
+                    f.seek(0)
+                    parser.set_encoding(enc)
+                    if parser.matches_format(f):
+                        formatparser = parser
+                        break
+                if formatparser is None:
+                    stderr.write("Error: input is not in a supported format.\n")
+                    return
+                #Parse:
+                f.seek(0)
+                formatparser.set_encoding(enc)
+                try:
+                    new_entries = formatparser.parse(f, hashes_base_path)
+                except HashSumFormatError as e:
+                    print("Skipping Input File '{}': {}".format(import_filename, str(e)))
+                algo = formatparser.get_parsed_algorithm()
+        return algo, new_entries
+
+    def import_hashes(self, filename, hashes_base_path:Path=None, use_algorithm_from_file=False):
+        """
+        Imports a hash file created by e.g. sha1sum, and populates
+        the database with this data. Examines each file to obtain the
+        size and mtime information.
+
+        If the file doesn't exist, it is added anyway with 'None' for size and mtime.
+        If the file exists but it's a directory or special file (socket, fifo, block device), it is skipped.
+
+        Returns the detected algorithm and the number of file hashes imported.
+        """
+        if hashes_base_path is None:
+            hashes_base_path = filename.parent.absolute()
+        try:
+            algo, new_entries = self._read_checksums(filename, hashes_base_path)
+        except (FileNotFoundError, PermissionError) as e:
+            raise ImportHashDatabaseError("Error importing file: {}".format(str(e)))
+        if len(new_entries) != 0:
+            if algo is None:
+                raise ImportHashDatabaseError("Error importing file: couldn't detect hash algorithm.")
+            if use_algorithm_from_file:
+                self.set_algorithm(algo)
+            else:
+                if algo != self.algorithm:
+                    raise ImportHashDatabaseError("Error importing file: Different hash algorithm '{}'. Expected '{}'.".format(algo, self.algorithm))
+        #Fill size, mtime and type from filesystem if the files exist.
+        #When they don't exist, leave as None and type as TYPE_FILE:
+        count = 0
+        for (file_path, entry) in new_entries.items():
+            if self._must_exclude_path(file_path):
+                continue
+            if entry.hash is None:
+                continue
+            if entry.type is None:
+                entry.update_type(self.symlink_mode)
+            try:
+                s, t = HashEntry.get_stat_and_type(file_path, self.symlink_mode)
+                if entry.size is None:
+                    entry.size = s.st_size
+                if entry.mtime is None:
+                    entry.mtime = s.st_mtime
+                if not S_ISREG(s.st_mode) and (self.symlink_mode == SymlinkMode.EXCLUDE or not S_ISLNK(s.st_mode)):  #Skip dirs and special files (block device, socket, etc).
+                    continue
+                if self.exclude_other_fs:
+                    if t == HashEntryType.TYPE_SYMLINK and self.path_fs != s.st_dev:
+                        continue
+            except (FileNotFoundError, PermissionError):
+                #Import the hash of the missing file and leave attributes like size and mtime as null/None. Type as TYPE_FILE.
+                pass
+            self.entries[entry.filename] = entry
+            count += 1
+        return algo, count
+
+    def dbimport(self, import_filename):
+        hashes_base_path = None
+        if self.path_is_forced:
+            hashes_base_path = self.path
+        algo, count = self.import_hashes(import_filename, hashes_base_path, True)
+        print("Imported {} entries from '{}' with algorithm '{}'".format(count, import_filename, algo))
+
+    def _must_exclude_path(self, abs_path: Path):
+        """
+        Checks if an absolute filename matches the list of excluded paths
+        Applies to both files and directories.
+        """
+        for ep in self.exclude_paths:
+            if path_is_subpath_of(abs_path, ep):
+                return True
+        return False
+
+    def _must_exclude_dir(self, dirpath: Path):
+        """
+        Checks if a directory matches the list of excluded paths
+        or is a mount point when other fs are excluded.
+        """
+        return (self._must_exclude_path(dirpath)
+                or (self.exclude_other_fs and self.path_fs != dirpath.stat().st_dev))
+
+    def _on_walk_error(self, e):
+        if hasattr(e, "filename"):
+            #Ignore errors on excluded paths:
+            if self._must_exclude_path(Path(e.filename).absolute()):
+                return
+            if self.exclude_other_fs:
+                try:
+                    if self.path_fs != stat(e.filename).st_dev:
+                        return
+                except:
+                    pass
+        #Display error:
+        stderr.write('\rError walking directories: {}\n'.format(str(e)))
+
+    def _find_changes(self, force_refresh_all=False):
+        """
+        Walks the filesystem. Identifies noteworthy files -- those
+        that were added, removed, or changed (size, mtime or type).
+
+        Returns a 3-tuple of sets of HashEntry objects:
+        [0] added files
+        [1] removed files
+        [2] modified files
+
+        self.entries is not modified; this method only reports changes.
+        """
+        added = set()
+        modified = set()
+        existing_files = set()
+        #Note: "walk()" will not walk into directory symlinks since followlinks is False (by default).
+        for dirpath_str, dirs, filenames in walk(str(self.path), topdown=True, onerror=self._on_walk_error):
+            dirpath = Path(dirpath_str)
+            dirs[:] = [d for d in dirs if not self._must_exclude_dir(dirpath / d)]  #Don't walk down into excluded subdirs.
+            if self._must_exclude_dir(dirpath):
+                continue
+            for filename in filenames:
+                if filename == DB_FILENAME:
+                    continue
+                abs_filename = (dirpath / filename).absolute()
+                if abs_filename == self.dbfilename:
+                    continue
+                if self._must_exclude_path(abs_filename):
+                    continue
+                try:
+                    s, t = HashEntry.get_stat_and_type(abs_filename, self.symlink_mode)
+                    if not S_ISREG(s.st_mode) and (self.symlink_mode == SymlinkMode.EXCLUDE or not S_ISLNK(s.st_mode)):  #Skip special files (block device, socket, etc).
+                        continue
+                    if self.exclude_other_fs:
+                        if t == HashEntryType.TYPE_SYMLINK and self.path_fs != s.st_dev:
+                            continue
+                except (FileNotFoundError, PermissionError):
+                    continue  #FileNotFoundError because directory changed while walking it, i.e., handles in procfs: '/proc/44668/task/44668/fdinfo/3'
+                              #Or Windows giving PermissionError on symlinks from Linux in a shared folder, then lstat() fails.
+                if abs_filename in self.entries:
+                    entry = self.entries[abs_filename]
+                    existing_files.add(entry)
+                    if force_refresh_all or not entry.equalsActual(s, t):
+                        modified.add(entry)
+                else:
+                    entry = HashEntry(abs_filename)
+                    entry.update_attrs(self.symlink_mode, s, t)
+                    added.add(entry)
+        removed = set(self.entries.values()) - existing_files
+        return added, removed, modified
+
+    def _find_changes_single_file(self, filename, force_refresh_all=False):
+        added = set()
+        modified = set()
+        removed = set()
+        if filename.name != DB_FILENAME and filename != self.dbfilename:
+            abs_filename = filename.absolute()
+            skip = False
+            if self._must_exclude_path(abs_filename):
+                skip = True
+            else:
+                try:
+                    s, t = HashEntry.get_stat_and_type(abs_filename, self.symlink_mode)
+                    if not S_ISREG(s.st_mode) and (self.symlink_mode == SymlinkMode.EXCLUDE or not S_ISLNK(s.st_mode)):  #Skip special files (block device, socket, etc).
+                        skip = True
+                    if self.exclude_other_fs:
+                        if t == HashEntryType.TYPE_SYMLINK and self.path_fs != s.st_dev:
+                            skip = True
+                except (FileNotFoundError, PermissionError):  #lstat() can fail with PermissionError in
+                    skip = True                               #Windows in a shared folder with symlinks.
+            if not skip:   #Note: This 'skip' must match HashEntry.exists().
+                if abs_filename in self.entries:
+                    entry = self.entries[abs_filename]
+                    if force_refresh_all or not entry.equalsActual(s, t):
+                        modified.add(entry)
+                else:
+                    entry = HashEntry(abs_filename)
+                    entry.update_attrs(self.symlink_mode, s, t)
+                    added.add(entry)
+            else:
+                if abs_filename in self.entries:
+                    removed.add(self.entries[abs_filename])
+        return added, removed, modified
+
+    def _update_entries(self, added, removed, modified):
+        global PROGRESS_BYTES_READ_TOTAL
+        errors = set()
+        startTime = time()
+        startBytesHashed = PROGRESS_BYTES_READ_TOTAL
+
+        #Added files:
+        bytesTotal = 0
+        for entry in added:
+            bytesTotal += entry.size if entry.size is not None else 0
+        mbTotal = bytesTotal / 1024 / 1024
+        bytesSeen = 0
+        i = 0
+        count = len(added)
+        error_count = 0
+        error_size = 0
+        for entry in added:
+            try:
+                entry.update(self.hc, self.symlink_mode)
+                self.entries[entry.filename] = entry
+            except Exception as e:
+                progressMsgClear()
+                stderr.write('\rError adding file: {}: {}\n'.format(type(e).__name__, entry.filename))
+                #raise(e)
+                errors.add(entry)
+                error_count += 1
+                error_size += entry.size if entry.size is not None else 0
+            i += 1
+            bytesSeen += entry.size if entry.size is not None else 0
+            elapsed = time() - startTime
+            elapsed = elapsed if elapsed != 0 else 0.001  #Avoid division by zero in old Windows
+            bytesHashed = PROGRESS_BYTES_READ_TOTAL - startBytesHashed
+            progressMsg('Added {} of {} files and {:.0f} MB of {:.0f} MB. Speed: {:.1f} MB/s'.format(i - error_count, count,
+                (bytesSeen - error_size) / 1024 / 1024, mbTotal, bytesHashed / elapsed / 1024 / 1024))
+        if i:
+            progressMsgNewLine()
+        if len(errors) > 0:
+            added = added - errors
+
+        #Removed files:
+        bytesTotal = 0
+        for entry in removed:
+            bytesTotal += entry.size if entry.size is not None else 0
+        mbTotal = bytesTotal / 1024 / 1024
+        count = len(removed)
+        for entry in removed:
+            del self.entries[entry.filename]
+        if count:
+            progressMsg('Removed {} files and {:.0f} MB'.format(count, mbTotal))
+            progressMsgNewLine()
+
+        #Modified files:
+        # Entries will appear in 'modified' if the size, mtime or type
+        # change. I've seen a lot of spurious mtime mismatches on vfat
+        # filesystems (like on USB flash drives), so only report files
+        # as modified if the hash changes.
+        startTime = time()
+        startBytesHashed = PROGRESS_BYTES_READ_TOTAL
+        bytesTotal = 0
+        for entry in modified:
+            bytesTotal += entry.size if entry.size is not None else 0  #(importing missing files produces None sizes)
+        mbTotal = bytesTotal / 1024 / 1024
+        bytesSeen = 0
+        i = 0
+        error_count = 0
+        error_size = 0
+        count = len(modified)
+        content_modified = set()
+        for entry in modified:
+            old_hash = entry.hash
+            try:
+                entry.update(self.hc, self.symlink_mode)
+                if entry.hash != old_hash:
+                    content_modified.add(entry)
+            except Exception as e:
+                progressMsgClear()
+                stderr.write('\rError updating file: {}: {}\n'.format(type(e).__name__, entry.filename))
+                content_modified.add(entry)  #Treat read errors as modified files.
+                #raise(e)
+                error_count += 1
+                error_size += entry.size if entry.size is not None else 0
+            i += 1
+            bytesSeen += entry.size if entry.size is not None else 0
+            elapsed = time() - startTime
+            elapsed = elapsed if elapsed != 0 else 0.001  #Avoid division by zero in old Windows
+            bytesHashed = PROGRESS_BYTES_READ_TOTAL - startBytesHashed
+            progressMsg('Refreshed {} of {} files and {:.0f} MB of {:.0f} MB. Speed: {:.1f} MB/s   '.format(i - error_count, count,
+                (bytesSeen - error_size) / 1024 / 1024, mbTotal, bytesHashed / elapsed / 1024 / 1024))
+        if i:
+            progressMsgNewLine()
+
+        return (
+            {entry.filename for entry in added},
+            {entry.filename for entry in removed},
+            {entry.filename for entry in content_modified},
+        )
+
+    def update_single_file(self, filename, force_refresh_all=False):
+        added, removed, modified = self._find_changes_single_file(filename, force_refresh_all)
+        return self._update_entries(added, removed, modified)
+
+    def update(self, force_refresh_all=False):
+        """
+        Walks the filesystem, adding and removing files from
+        the database as appropriate.
+
+        Returns a 3-tuple of sets of filenames:
+        [0] added files
+        [1] removed files
+        [2] modified files
+        """
+        added, removed, modified = self._find_changes(force_refresh_all)
+        return self._update_entries(added, removed, modified)
+
+
+    def status(self):
+        added, removed, modified = self._find_changes()
+        return (
+            {entry.filename for entry in added},
+            {entry.filename for entry in removed},
+            {entry.filename for entry in modified},
+        )
+
+    def status_single_file(self, filename):
+        added, removed, modified = self._find_changes_single_file(filename)
+        return (
+            {entry.filename for entry in added},
+            {entry.filename for entry in removed},
+            {entry.filename for entry in modified},
+        )
+
+    def verify(self, verbose_failures=False):
+        """
+        Calls each HashEntry's verify method to make sure that
+        nothing has changed on disk.
+
+        Returns a 2-tuple of sets of filenames:
+        [0] modified files
+        [1] removed files
+        """
+        global PROGRESS_BYTES_READ_TOTAL
+        startTime = time()
+        startBytesHashed = PROGRESS_BYTES_READ_TOTAL
+        modified = set()
+        removed = set()
+        count = len(self.entries)
+        #Compute total bytes:
+        bytesTotal = 0
+        i = 0
+        for i, entry in enumerate(self.entries.values(), 1):
+            bytesTotal += entry.size if entry.size is not None else 0  #(importing missing files produces None sizes)
+        mbTotal = bytesTotal / 1024 / 1024
+        bytesSeen = 0
+        i = 0
+        error_count = 0
+        error_size = 0
+        for i, entry in enumerate(self.entries.values(), 1):
+            if entry.exists(self.symlink_mode):
+                try:
+                    if entry.verify(self.hc, self.symlink_mode):
+                        entry.update_attrs(self.symlink_mode)
+                    else:
+                        if verbose_failures:
+                            progressMsgClear()
+                            stderr.write('\r{} failed hash verification\n'.format(entry.filename))
+                        modified.add(entry.filename)
+                except Exception as e:
+                    progressMsgClear()
+                    stderr.write('\rError verifying file: {}: {}\n'.format(type(e).__name__, entry.filename))
+                    modified.add(entry.filename)  #Treat read errors as modified files.
+                    error_count += 1
+                    error_size += entry.size if entry.size is not None else 0
+            else:
+                removed.add(entry.filename)
+                if verbose_failures:
+                    progressMsgClear()
+                    stderr.write('\r{} is missing\n'.format(entry.filename))
+            bytesSeen += entry.size if entry.size is not None else 0
+            elapsed = time() - startTime
+            elapsed = elapsed if elapsed != 0 else 0.001  #Avoid division by zero in old Windows
+            bytesHashed = PROGRESS_BYTES_READ_TOTAL - startBytesHashed
+            progressMsg('Checked {} of {} files and {:.0f} MB of {:.0f} MB. Speed: {:.1f} MB/s'.format(i - error_count, count,
+                (bytesSeen - error_size) / 1024 / 1024, mbTotal, bytesHashed / elapsed / 1024 / 1024))
+        if i:
+            progressMsgNewLine()
+        return modified, removed
+
+    #Used by export() and dirsum():
+    def _export_entry(self, entry):
+        filename = str(entry.filename.relative_to(self.path))
+        if os.sep == '\\':
+            filename = filename.replace("\\", "/")  #This is to have the exact same exported file and dirsum across
+                                                    #all platforms that use the same DB.
+                                                    #It can't be replaced in the other direction because there are Linux
+                                                    #files that contain '\\' as part of the filename.
+        if entry.hash is None:
+            #Skip inaccessible files (permissions, etc.). If not, then encode() crashes.
+            return b''
+        enchash = entry.hash.encode('ascii')
+        esc = b''
+        if '\\' in filename or '\n' in filename:
+            #Example: (this is done also by the tools sha1sum, sha512sum, etc. for filenames with newlines):
+            #  \adc83b19e793491b1c6ea0fd8b46cd9f32e592fc  aaaa\naaaa
+            #  \444c7f23103b937ba83ec30ddcae5666121d3968  bla\\taaa
+            esc = b'\\'
+            if os.sep == "/":
+                filename = filename.replace("\\", "\\\\")
+            filename = filename.replace("\n", "\\n")
+        try:
+            encfilename = fsencode(filename)
+        except UnicodeEncodeError as e:
+            #This error only happens in certain Windows, like WindowsXP console with
+            #a filename that has japanese chars:
+            stderr.write("Error with filename, will encode it escaped. "
+                + "Details: {}. Filename: {}\n".format(str(e), filename.encode("raw_unicode_escape")))
+            esc = b'\\'
+            encfilename = filename.encode("raw_unicode_escape")
+        line = esc + enchash + b'  ' + encfilename + b'\n'
+        return line
+
+
+    def export(self):
+        """
+        Exports the hash database in normal SHA*SUM format, usable as
+        input to `sha*sum -c`.
+        If the DB algorithm is 'sha256', then the exported filename will
+        be 'SHA256SUM' and it can be checked with 'sha256sum -c SHA256SUM'.
+        If the DB algorithm is 'md5' then the exported filename will be MD5SUM.
+
+        The destination file is not part of the exported hashes, if it already existed,
+        so that it will not fail when checking itself.
+
+        Returns the number of entries exported.
+        """
+        hash_filename = self.path / self.hc.get_export_filename()
+        count = 0
+        with hash_filename.open('wb') as f:
+            for name in sorted_paths_safe(self.entries):
+                if name == hash_filename:  #Don't write to "SHA256SUM" the hash of of the file "SHA256SUM".
+                    continue               #It can never hash itself correctly by definition.
+                entry = self.entries[name]
+                line = self._export_entry(entry)
+                f.write(line)
+                count += 1
+        return count
+
+    def dirsum(self):
+        """
+        Returns a single hash representing the whole directory and all its recursive files,
+        as indexed in the .json database. With one single hash, you can know if two copies
+        of a directory are exactly the same, or if a directory never changed.
+
+        Equivalent to exporting the checksums to a file (sorted by filename) and hashing that file.
+        This:
+             checksum_db dirsum
+        is the same result as this (when algorithm is 'sha1'):
+
+             checksum_db export && sha1sum SHA1SUM && rm SHA1SUM
+
+        but without the temporary file creation and without executing an additional program.
+        Note: erase SHA1SUM and re-update before making comparisons between export and dirsum.
+        It is also similar to this:
+
+             find -type f -print0 | sort -z | xargs -0 sha1sum | sha1sum   #Compare directories
+
+        But actually almost exactly like:
+
+             find ! -name 'checksum_db.json' -type f -printf '%P\0' | LC_ALL=C sort -z | xargs -0 sha1sum | sha1sum   #Compare directories
+
+             Notes: -The -printf '%P\0' ensures that there are no leading "./" in pathnames (only for GNU find).
+                    -The "! -name 'checksum_db.json'" is to ignore DB files, as this program does.
+                    -The "-type f" selects regular files and excludes dirs, symlinks, sockets, fifos,
+                     block devices, etc..
+                    -The LC_ALL=C is there to have predictable locale independent behaviour of 'sort'
+                     and make it sort in case sensitive order and make it not ignore dots and other chars.
+                    -The \0 in '%P\0' and the -z and -0 switches are for using null char separator,
+                     to make it work with filenames that have spaces or newlines.
+                    -If the DB was created with "--exclude-other-fs", then "-xdev" can be passed to "find"
+                     to match that.
+
+        Exactly the same except that to have the same hash result to that find command, there shouldn't be
+        any symlinks (-type f) and no other excluded paths in the DB.
+        Linux 'sort' command is case insensitive by default and ignores dots and other non alphanumeric
+        chars for collation. That means that files that have the same name but different case, that coexist
+        in the same directory, will be sorted in an unpredictable manner and files with dots in their names
+        will be sorted differently. This is all fixed by setting LC_ALL=C or LC_COLLATE=C in the sort
+        invocation above.
+          If "-type f,l" was used to also include symlinks, there would be no way to exclude symlinks to
+        sockets, fifos, block devices, etc., like this program already excludes, ie: checksum_db does hash
+        symlinks to regular files and broken symlinks names, while avoiding symlinks to special files and dirs,
+        but the find command cannot do exactly that.
+          The following is the BusyBox shell version:
+
+             find .[^.]* * ! -name 'checksum_db.json' -type f -print0 | sort -z | xargs -0 sha1sum | sha1sum   #Compare directories
+
+        The wildcards ".[^.]* *" are for listing the files without leading "./" dot slashes, since BusyBox
+        "find" doesn't have "-printf".
+          A version using "cut -z -b3-" is also possible (to remove the dot slash) but it wouldn't work in
+        BusyBox because its "cut" command doesn't have the "-z" necessary to accept NUL filename terminators.
+
+        Sizes and modification times are ignored by dirsum. Only the file hashes and filenames in the
+        database are used as input, fed in a predictable order.
+        Empty subdirectories are not taken into account, and won't change the hash result.
+
+        No temporary files are written during this operation, nothing is changed in the disk.
+
+        By running:
+
+             checksum_db dirsum *
+
+        one can see the dirsum of subdirectories and the checksum of files. It is very useful to pinpoint where
+        does the difference come from. It is not equivalent to "find */", instead it is equivalent, for listing
+        immediate subdirs, to:
+
+             for a in */; do echo -n "$a: "; cd "$a"; find ! -name 'checksum_db.json' -type f -printf '%P\0' | LC_ALL=C sort -z | xargs -0 sha1sum | sha1sum; cd ..; done
+
+        That means: change dir to the desired directory before running find. That is because the dirsum of
+        subdirectories in "dirsum *" uses the filenames relatives to those subdirectories, and not relative
+        to the parent directory.
+
+        Returns the hash string.
+        """
+        h = self.hc.hash_function()
+        for name in sorted_paths_safe(self.entries):
+            entry = self.entries[name]
+            line = self._export_entry(entry)
+            h.update(line)
+        return h.hexdigest()
+
+    def merge(self, new_db, removed=None):
+        #Check compatibility:
+        if new_db.algorithm != self.algorithm:
+            raise MergeHashDatabaseError("Different hash algorithm '{}'. Expected '{}'.".format(new_db.algorithm, self.algorithm))
+        #Remove. It is safe since all filenames are absolute:
+        if removed is not None:
+            for removedFilename in removed:
+                del self.entries[removedFilename]
+        #Merge excluded paths:
+        self.add_exclude_paths_from_db(new_db)
+        #(Ignore 'exclude_other_fs' value in merged subfolder.)
+        #Insert new entries and Overwrite old entries from new_db:
+        count = 0
+        for entry_filename, entry in new_db.entries.items():
+            if self.symlink_mode == SymlinkMode.EXCLUDE and entry.type == HashEntryType.TYPE_SYMLINK:
+                continue
+            if self._must_exclude_path(entry_filename):
+                continue
+            self.entries[entry_filename] = entry
+            count += 1
+        return count
+
+    def duplicates(self, min_size=0):
+        entriesByHash = {}
+        dupHashes = set()
+        for name in sorted_paths_safe(self.entries):
+            entry = self.entries[name]
+            if not entry.hash in entriesByHash:
+                entriesByHash[entry.hash] = [entry]
+            else:
+                dupHashes.add(entry.hash)
+                entriesByHash[entry.hash].append(entry)
+        for h in dupHashes:
+            entryList = entriesByHash[h]
+            if entryList[0].size < min_size:
+                continue
+            print("Size: {}, Hash: {}, Count: {}".format(entryList[0].size, h, len(entryList)))
+            for e in entryList:
+                print("{}".format(e.filename))
+            print()  #Leave a newline
+
+def print_file_list(files):
+    for filename in sorted_paths_safe(files):
+        printable_filename = SURROGATE_ESCAPES.sub('\ufffd', str(filename))
+        try:
+            print(printable_filename)
+        except UnicodeEncodeError as e:
+            #This happens in a Windows console without Unicode (WinXP with MingGW bash,
+            #probably using CP437), with a filename that has japanese chars:
+            stderr.write("Error printing filename, will print escaped. Details: {}\n".format(str(e)))
+            try:
+                print(printable_filename.encode("raw_unicode_escape").decode())  #Try to print string with \uxxx
+            except UnicodeDecodeError:
+                print(printable_filename.encode("raw_unicode_escape"))  #Print binary string instead
+    print()
+
+def print_file_lists(added, removed, modified):
+    if added or removed or modified:
+        print() #Separator newline
+    if added:
+        print(ADDED_COLOR + 'Added files:' + NO_COLOR)
+        print_file_list(added)
+    if removed:
+        print(REMOVED_COLOR + 'Removed files:' + NO_COLOR)
+        print_file_list(removed)
+    if modified:
+        print(MODIFIED_COLOR + 'Modified files:' + NO_COLOR)
+        print_file_list(modified)
+
+def print_algorithm_not_supported(algo):
+    stderr.write("Error: Algorithm '" + algo + "' is not supported.\n")
+    stderr.write("Please specify one of the following: " + ", ".join(sorted(accepted_algorithms())) + "\n")
+
+def print_elapsed_and_speed():
+    global PROGRESS_START_TIME, PROGRESS_BYTES_READ_TOTAL
+    elapsed = time() - PROGRESS_START_TIME
+    elapsed = elapsed if elapsed != 0 else 0.001  #Avoid division by zero in old Windows
+    stderr.write("Elapsed: {:.3f} s, Speed: {:.1f} MB/s\n".format(elapsed, PROGRESS_BYTES_READ_TOTAL / elapsed / 1024.0 / 1024.0))
+
+def init(db, args):
+    print('Initializing hash database')
+    if db.dbfilename is None:
+        #Use .json in current directory when --db not specified:
+        db.dbfilename = Path(getcwd()) / DB_FILENAME
+    if args.algo is not None:
+        if args.algo not in accepted_algorithms():
+            print_algorithm_not_supported(args.algo)
+            return
+        db.set_algorithm(args.algo)
+    db.set_exclude_paths(args.exclude)
+    db.exclude_other_fs = args.exclude_other_fs
+    if not args.empty:
+        added, removed, modified = db.update()
+        print_file_lists(added, removed, modified)
+    if not args.pretend:
+        db.save()
+    print_elapsed_and_speed()
+
+def update(db, args):
+    print('Updating hash database')
+    if args.dbimport is None:
+        db.load()
+    db.ensure_base_path_exists()
+    if len(args.subdirs) == 0:
+        #No path arguments. Use whole database:
+        added, removed, modified = db.update(args.force)
+    else:
+        #List of paths:
+        added = set()
+        modified = set()
+        removed = set()
+        for subdir in args.subdirs:
+            abs_filename = Path(path_normpath(str(subdir.absolute())))   #Note: Can't use resolve() because it resolves symlinks in addition to interpreting ".." segments.
+            progressMsg("{}:".format(abs_filename))   #Print subdir
+            progressMsgNewLine()
+            if not abs_filename.is_dir():
+                #File. Use entry already in database:
+                #Note: It isn't appropriate to use db.split_single_file() since the new_db.path would
+                #      confuse the update method and re-add all files under that path as added.
+                #      Using db.update_single_file() instead.
+                added_subdir, removed_subdir, modified_subdir = db.update_single_file(abs_filename, args.force)
+            else:
+                if abs_filename.is_symlink():
+                    #Symlinks to directories are not returned by walk().
+                    continue
+                #Update the subdir only:
+                new_db = db.split(abs_filename)
+                added_subdir, removed_subdir, modified_subdir = new_db.update(args.force)
+                db.merge(new_db, removed_subdir)
+            added |= added_subdir
+            modified |= modified_subdir
+            removed |= removed_subdir
+    print_file_lists(added, removed, modified)
+    if not args.pretend:
+        db.save()
+    print_elapsed_and_speed()
+
+def status(db, args):
+    if args.dbimport is None:
+        db.load()
+    db.ensure_base_path_exists()
+    if len(args.subdirs) == 0:
+        #No path arguments. Use whole database:
+        added, removed, modified = db.status()
+    else:
+        #List of paths:
+        added = set()
+        modified = set()
+        removed = set()
+        for subdir in args.subdirs:
+            abs_filename = Path(path_normpath(str(subdir.absolute())))   #Note: Can't use resolve() because it resolves symlinks in addition to interpreting ".." segments.
+            progressMsg("{}:".format(abs_filename))   #Print subdir
+            progressMsgNewLine()
+            if not abs_filename.is_dir():
+                #File. Use entry already in database:
+                #Note: It isn't appropriate to use db.split_single_file() since the new_db.path would
+                #      confuse the status method and mark all files under that path as added.
+                #      Using db.status_single_file() instead.
+                added_subdir, removed_subdir, modified_subdir = db.status_single_file(abs_filename)
+            else:
+                if abs_filename.is_symlink():
+                    #Symlinks to directories are not returned by walk().
+                    continue
+                #Directory. Use sub-database:
+                new_db = db.split(abs_filename)
+                added_subdir, removed_subdir, modified_subdir = new_db.status()
+            added |= added_subdir
+            modified |= modified_subdir
+            removed |= removed_subdir
+    print_file_lists(added, removed, modified)
+
+def import_hashes(db, args):
+    print('Importing hashes')
+    if db.dbfilename is None:
+        #Use .json in DB directory when --db not specified, which is the current
+        #directory when --path is not specified either:
+        db.dbfilename = db.path / DB_FILENAME
+    #Algorithm to use for new DB:
+    algo = DEFAULT_HASH_ALGORITHM
+    if "algo" in args and args.algo is not None:
+        if args.algo not in accepted_algorithms():
+            print_algorithm_not_supported(args.algo)
+            return
+        algo = args.algo
+    db.set_algorithm(algo)
+    db.set_exclude_paths(args.exclude)
+    db.exclude_other_fs = args.exclude_other_fs
+    #Look for checksum files recursively and import them. Also import all found .json files.
+    overall_count = 0
+    for import_filename in db.find_external_hash_files(db.path.absolute()):
+        if import_filename.name == DB_FILENAME:
+            temp_db = HashDatabase(import_filename.parent, import_filename)
+            temp_db.path_is_forced = False
+            try:
+                temp_db.load()
+                count = db.merge(temp_db)
+            except (LoadHashDatabaseError, MergeHashDatabaseError) as e:
+                print("Skipping DB '{}': {}".format(import_filename, str(e)))
+                count = 0
+        else:
+            try:
+                algo, count = db.import_hashes(import_filename)
+            except ImportHashDatabaseError as e:
+                print("Skipping '{}': {}".format(import_filename, str(e)))
+                count = 0
+        overall_count += count
+        print("Imported {} entries from '{}'".format(count, import_filename))
+    print('\nImported {} total entries'.format(overall_count))
+    if not args.pretend:
+        db.save()
+
+def verify(db, args):
+    if args.dbimport is None:
+        db.load()
+    db.ensure_base_path_exists()
+    if len(args.subdirs) == 0:
+        #No path arguments. Verify the whole database:
+        modified, removed = db.verify(args.verbose_failures)
+    else:
+        #List of paths:
+        modified = set()
+        removed = set()
+        for subdir in args.subdirs:
+            abs_filename = Path(path_normpath(str(subdir.absolute())))   #Note: Can't use resolve() because it resolves symlinks in addition to interpreting ".." segments.
+            progressMsg("{}:".format(abs_filename))  #Print subdir
+            progressMsgNewLine()
+            if not abs_filename.is_dir():
+                #File. Use hash already in database:
+                new_db = db.split_single_file(abs_filename)
+            else:
+                if abs_filename.is_symlink():
+                    #Symlinks to directories are not returned by walk().
+                    continue
+                #Directory:
+                new_db = db.split(abs_filename)
+            modified_subdir, removed_subdir = new_db.verify(args.verbose_failures)
+            modified |= modified_subdir
+            removed |= removed_subdir
+            db.merge(new_db, None)  #Merge mtimes but not removed files
+
+    print_file_lists(None, removed, modified)
+    if args.update_mtimes and not args.pretend:
+        db.save()
+    print_elapsed_and_speed()
+
+def split(db, args):
+    if args.dbimport is None:
+        db.load()
+    db.ensure_base_path_exists()
+    if not args.subdir.is_dir():
+        stderr.write("Error splitting DB: Not a directory '{}'\n".format(args.subdir))
+        return
+    new_db = db.split(args.subdir)
+    if not args.pretend:
+        new_db.save()  #Save to subdir
+    print('Wrote {} hash entries to {}'.format(len(new_db.entries), new_db.path / DB_FILENAME))
+
+def merge(db, args):
+    if args.dbimport is None:
+        db.load()
+    db.ensure_base_path_exists()
+    abs_subdir = Path(path_normpath(str(args.subdir.absolute())))   #Note: Can't use resolve() because it resolves symlinks in addition to interpreting ".." segments.
+    merge_filename = abs_subdir / DB_FILENAME
+    if not merge_filename.is_file():
+        stderr.write("No DB found at '{}'\n".format(merge_filename))
+        return
+    temp_db = HashDatabase(abs_subdir, merge_filename)
+    temp_db.path_is_forced = False
+    temp_db.load()
+    try:
+        count = db.merge(temp_db)
+    except MergeHashDatabaseError as e:
+        stderr.write("Skipping DB '{}': {}\n".format(merge_filename, str(e)))
+        count = 0
+    if not args.pretend:
+        db.save()
+    print('Merged {} / {} hash entries from {}'.format(count, len(temp_db.entries), temp_db.path / DB_FILENAME))
+
+def export(db, args):
+    if args.dbimport is None:
+        db.load()
+    db.ensure_base_path_exists()
+    try:
+        count = db.export()
+        print('Exported {} entries to {}'.format(count, db.path / db.hc.get_export_filename()))
+    except (OSError, PermissionError) as e:  #Note: OSError happens with a read-only filesystem.
+        stderr.write("Error exporting DB: {}\n".format(str(e)))
+
+def dirsumnow(db, args):
+    if args.dbimport is None:
+        try:
+            db.load()    #If present, load the DB for the path, algorithm, excluded dirs, and exclude-other-fs options.
+        except LoadHashDatabaseError:
+            pass
+    db.entries = {}  #Start with a fresh DB to force checksums from disk in dirsumnow. This 'dirsumnow' command won't re-save the DB to disk.
+    pathHashes = {}
+    if "algo" in args and args.algo is not None:
+        if args.algo not in accepted_algorithms():
+            print_algorithm_not_supported(args.algo)
+            return
+        algo = args.algo
+        db.set_algorithm(algo)
+    #ToDo: add --exclude_other_fs and --exclude as dirsumnow options? Only take it from original DB?
+    if len(args.subdirs) == 0:
+        #No path arguments. Take the sum of the whole database:
+        db.update(True)
+        if len(db.entries) != 0:
+            h = db.dirsum()
+        else:
+            h = db.hc.pad_to_hash_length("(no info)")
+        pathHashes[db.path] = h
+    else:
+        #List of paths:
+        for subdir in args.subdirs:
+            abs_filename = Path(path_normpath(str(subdir.absolute())))   #Note: Can't use resolve() because it resolves symlinks in addition to interpreting ".." segments.
+            if abs_filename in pathHashes:
+                continue   #Duplicated argument
+            h = ""
+            if not abs_filename.is_dir():
+                #File.
+                new_db = db.split_single_file(abs_filename)
+                added_file, removed_file, modified_file = new_db.update_single_file(abs_filename, True)
+                if abs_filename in new_db.entries:
+                    entry = new_db.entries[abs_filename]
+                    h = entry.hash
+                else:
+                    h = db.hc.pad_to_hash_length("(skipped)")
+            else:
+                if abs_filename.is_symlink():
+                    #Symlinks to directories are not returned by walk().
+                    h = db.hc.pad_to_hash_length("(skipped)")
+                else:
+                    #Directory. Take the sum of the whole sub-database:
+                    new_db = db.split(abs_filename)
+                    new_db.update(True)
+                    if len(new_db.entries) != 0:
+                        h = new_db.dirsum()
+                    else:
+                        h = db.hc.pad_to_hash_length("(no info)")
+            pathHashes[abs_filename] = h
+    for path in sorted_paths_safe(pathHashes):
+        h = pathHashes[path]
+        print('{}  {}'.format(h, path))
+
+def dirsum(db, args):
+    if args.dbimport is None:
+        db.load()
+    pathHashes = {}
+    if len(args.subdirs) == 0:
+        #No path arguments. Take the sum of the whole database:
+        if len(db.entries) != 0:
+            h = db.dirsum()
+        else:
+            h = db.hc.pad_to_hash_length("(no info)")
+        pathHashes[db.path] = h
+    else:
+        #List of paths:
+        args.subdirs = sorted_paths_safe(args.subdirs)
+        for subdir in args.subdirs:
+            abs_filename = Path(path_normpath(str(subdir.absolute())))   #Note: Can't use resolve() because it resolves symlinks in addition to interpreting ".." segments.
+            if abs_filename in pathHashes:
+                continue   #Duplicated argument
+            h = ""
+            if not abs_filename.is_dir():
+                #File. Use hash already in database:
+                if abs_filename in db.entries:
+                    entry = db.entries[abs_filename]
+                    h = entry.hash
+                else:
+                    h = db.hc.pad_to_hash_length("(not in db)")
+            else:
+                if abs_filename.is_symlink():
+                    #Symlinks to directories are not returned by walk().
+                    h = db.hc.pad_to_hash_length("(not in db)")
+                else:
+                    #Directory. Take the sum of the whole sub-database:
+                    new_db = db.split(abs_filename)
+                    if len(new_db.entries) != 0:
+                        h = new_db.dirsum()
+                    else:
+                        h = db.hc.pad_to_hash_length("(no info)")
+            pathHashes[abs_filename] = h
+    for path in sorted_paths_safe(pathHashes):
+        h = pathHashes[path]
+        print('{}  {}'.format(h, path))
+
+def duplicates(db, args):
+    if args.dbimport is None:
+        try:
+            db.load()    #If present, load the DB for the path, algorithm, excluded dirs, and exclude-other-fs options.
+        except LoadHashDatabaseError:
+            pass
+    min_size = 0
+    if args.min_size is not None:
+        try:
+            min_size = int(args.min_size)
+        except:
+            stderr.write("Error: --min-size argument '{}' is not numeric.\n".format(args.min_size))
+            exit(1)
+    if len(args.subdirs) == 0:
+        #No path arguments. Take the sum of the whole database:
+        db.duplicates(min_size)
+    else:
+        #List of paths. Gather the subsets of the DB and do a single duplicates call.
+        sub_dbs = {}
+        for subdir in args.subdirs:
+            abs_filename = Path(path_normpath(str(subdir.absolute())))   #Note: Can't use resolve() because it resolves symlinks in addition to interpreting ".." segments.
+            if abs_filename in sub_dbs:
+                continue   #Duplicated argument
+            h = ""
+            if not abs_filename.is_dir():
+                #File.
+                new_db = db.split_single_file(abs_filename)
+                sub_dbs[abs_filename] = new_db
+            else:
+                if abs_filename.is_symlink():
+                    #Symlinks to directories are not returned by walk().
+                    sub_dbs[abs_filename] = None
+                else:
+                    #Directory. Take the sum of the whole sub-database:
+                    new_db = db.split(abs_filename)
+                    sub_dbs[abs_filename] = new_db
+        #Merge sub_dbs to an empty DB:
+        db.entries = {}
+        for abs_filename in sub_dbs:
+            sub_db = sub_dbs[abs_filename]
+            if sub_db is not None:
+                db.merge(sub_db)
+        #Call duplicates a single time:
+        db.duplicates(min_size)
+
+if __name__ == '__main__':
+    parser = ArgumentParser()
+    parser.add_argument('-n', '--pretend', action='store_true')
+    parser.add_argument('-q', '--quiet', action='store_true')
+    parser.add_argument('-@', '-m', '--modify-window', help=('The default is 1. If the modification time differs by more than this amount of seconds, '
+        'the \'status\' command considers those Modified Files, and the \'update\' command will recheck the contents to make sure. '
+        'If the value is -1 or any negative value, the fractional seconds have to be exactly the same. If the value is 0, only '
+        'the integer seconds are compared. The default is 1, to allow normal FAT32 and exFAT differences since those only have 2s '
+        'resolution. Use 3600 when there is a normal one hour Day Light Savings difference between systems and the files '
+        'went through a filesystem that only stores local time and not UTC, like FAT32 and exFAT and certain optical media '
+        'formats. You can use \'verify --update-mtimes\' to rectify modification times in the DB when the file hash remains the same.'))
+    parser.add_argument('--db', type=Path, help=('Filename of the .json DB to use or to save to.'))
+    parser.add_argument('-c', '--dbimport', type=Path, help=('Filename of a digest file (MD5SUM, SHA256SUM, etc.) to load '
+        'instead of a json DB. It can be \'-\' for stdin. You can run any DB command at the same time like \'verify\'. '
+        'If --db is not additionally specified, then an automatic destination DB filename is chosen '
+        'as \'DBIMPORT_' + DB_FILENAME + '\'. When specifying --dbimport and the init command, an update is '
+        'run before saving to the destination DB. The supported digest formats are: MD5SUM, SHA*SUM, the Xdeep commands '
+        'with -z size option (md5deep, sha1deep, sha256deep, whirlpooldeep with -z) and a format with '
+        '"size hash modification_time filename" fields. If no command is specified, then \'verify\' is assumed. Example: '
+        'checksum_db -c DVDSHA256SUM --path path/to/dvd'))
+    parser.add_argument('--path', type=Path, help=('The start path that the DB covers to checksum or verify recursively. '
+        'The filenames in the DB are relative to this path. The default is the directory where the DB file is stored '
+        'or the current directory. It can be combined with --db or --dbimport, for instance to checksum a blueray or any '
+        'read only media, or the system drive without writing anything the DB to it by separating the DB filename from '
+        'the checksummed path. The path option is stored in the DB and doesn\'t need to be specified again.'))
+    parser.add_argument('--se', '--symlink-exclude', "--typef", dest='symlink_mode', action='store_const', const=SymlinkMode.EXCLUDE,
+            help=('Skip symlinks. The option is saved to the DB.'))
+    parser.add_argument('--sn', '--symlink-names', dest='symlink_mode', action='store_const', const=SymlinkMode.NAMES,
+            help=('Hash only the symlink destination name string. The option is saved to the DB.'))
+    parser.add_argument('--sc', '--symlink-contents', dest='symlink_mode', action='store_const', const=SymlinkMode.CONTENTS,
+            help=('(Default) Hash symlink destination contents, and if a symlink is broken, hash its destination name string '
+                  'instead. The option is saved to the DB.'))
+    subparsers = parser.add_subparsers()
+
+    parser_init = subparsers.add_parser('init')
+    parser_init.add_argument('--empty', action='store_true', help=('Create an empty DB. '
+        'You can add subdirs or files later one by one via: update [subdir]'))
+    parser_init.add_argument('-a', '--algo', '--algorithm', help=('Algorithm to use for this DB. '
+        'It can be any supported by Python hashlib. It needs to be specified only in init. '
+        'The default is \'' + DEFAULT_HASH_ALGORITHM + '\'. '
+        'Available: ' + ", ".join(sorted(accepted_algorithms()))))
+    parser_init.add_argument('--exclude', action='append', help=('Add a path to skip to the DB. It can be a directory or a file. '
+        'The path can be relative (to the DB start path) or absolute. Patterns are not supported, no wildcards and no regex. '
+        'The exclude paths will be relativized and propagated when the DB is split to a subdirectory, or a subset of the DB is '
+        'selected for updating or verifying.'))
+    parser_init.add_argument('-x', '--exclude-other-fs', '--xdev', action='store_true', help=('Don\'t checksum '
+        'subdirectories of different filesystems (like /dev, /proc ...) or other mount points. The option is saved to the DB.'))
+    parser_init.set_defaults(func=init)
+
+    parser_update = subparsers.add_parser('update')
+    parser_update.add_argument('-f', '--force', action='store_true', help=('Force refresh all hashes'))
+    parser_update.add_argument('subdirs', type=Path, nargs='*')
+    parser_update.set_defaults(func=update)
+
+    parser_status = subparsers.add_parser('status')
+    parser_status.add_argument('subdirs', type=Path, nargs='*')
+    parser_status.set_defaults(func=status)
+
+    parser_import = subparsers.add_parser('import')
+    parser_import.add_argument('-a', '--algo', '--algorithm', help=('Algorithm to use for import. '
+        'It can be any supported by Python hashlib. '
+        'The default is \'' + DEFAULT_HASH_ALGORITHM + '\'. '
+        'Available: ' + ", ".join(sorted(accepted_algorithms()))))
+    parser_import.add_argument('--exclude', action='append', help=('Add a path to skip to the DB. It can be a directory or a file. '
+        'The path can be relative (to the DB start path)  or absolute. Patterns are not supported, no wildcards and no regex. '
+        'The exclude paths will be relativized and propagated when the DB is split to a subdirectory, or a subset of the DB is '
+        'selected for updating or verifying.'))
+    parser_import.add_argument('-x', '--exclude-other-fs', '--xdev', action='store_true', help=('Don\'t checksum '
+        'subdirectories of different filesystems (like /dev, /proc ...) or other mount points. The option is saved to the DB.'))
+    parser_import.set_defaults(func=import_hashes)
+
+    parser_verify = subparsers.add_parser('verify')
+    parser_verify.add_argument('--verbose-failures', '--vf', action='store_true', help=('If hash '
+        'verification fails, print filenames as soon as they are known in addition '
+        'to the post-hashing summary.'))
+    parser_verify.add_argument('--update-mtimes', '--um', action='store_true', help=('If hash '
+        'verification of a file succeeds, update its stored modification time to match '
+        'that of the file on disk.'))
+    parser_verify.add_argument('subdirs', type=Path, nargs='*')
+    parser_verify.set_defaults(func=verify)
+
+    parser_split = subparsers.add_parser('split', help=('Saves a subset of this DB to a .json in the specified '
+        'subdirectory, with the same algorithm and with the excluded paths that apply to that subtree.'))
+    parser_split.add_argument('subdir', type=Path)
+    parser_split.set_defaults(func=split)
+
+    parser_merge = subparsers.add_parser('merge', help=('The opposite of split: takes a '
+        'subdir and reads its .json and brings the entries to this DB without hashing the subdir files. '
+        'Merges the list of excluded paths options too. The checksum algorithm must match.'))
+    parser_merge.add_argument('subdir', type=Path)
+    parser_merge.set_defaults(func=merge)
+
+    parser_export = subparsers.add_parser('export', help=('Exports the checksum database '
+        'in digest format to a file in the directory covered by the DB. It will be SHA1SUM for sha1, '
+        'or MD5SUM for md5, etc, depending on the algorithm of the DB. '))
+    parser_export.set_defaults(func=export)
+
+    parser_dirsum = subparsers.add_parser('dirsum', help=('Return a single hash representing '
+        'a whole directory. Uses only the DB and doesn\'t access the files.'))
+    parser_dirsum.add_argument('subdirs', type=Path, nargs='*')
+    parser_dirsum.set_defaults(func=dirsum)
+
+    parser_dirsumnow = subparsers.add_parser('dirsumnow', help=('Hash files now to '
+        'display checksum. Reads all the specified files. Doesn\'t use or change the DB'))
+    parser_dirsumnow.add_argument('subdirs', type=Path, nargs='*')
+    parser_dirsumnow.add_argument('-a', '--algo', '--algorithm', help=('Algorithm to use for dirsumnow. '
+        'It can be any supported by Python hashlib. '
+        'The default is \'' + DEFAULT_HASH_ALGORITHM + '\'. '
+        'Available: ' + ", ".join(sorted(accepted_algorithms()))))
+    parser_dirsumnow.set_defaults(func=dirsumnow)
+
+    parser_duplicates = subparsers.add_parser('duplicates', help=('List all the duplicate files in the DB (same hash) '
+        'Uses only the DB and doesn\'t access the files.'))
+    parser_duplicates.add_argument('subdirs', type=Path, nargs='*')
+    parser_duplicates.add_argument('--min-size', help=('The default is 0. Minimum size filter for duplicate files, in '
+        'bytes. Use 1 to exclude 0 byte files'))
+    parser_duplicates.set_defaults(func=duplicates)
+
+    try:
+        args = parser.parse_args()
+        if "func" not in args and args.dbimport is not None:
+            #Default action when -c or --dbimport are specified is 'verify':
+            args.func = verify
+            args.subdirs = []
+            args.verbose_failures = False
+            args.update_mtimes = False
+        if "func" not in args:
+            parser.print_help()
+            exit(1)
+        if args.quiet:
+            SHOW_PROGRESS_MSG = False
+        if args.modify_window is not None:
+            try:
+                MODIFY_WINDOW = int(args.modify_window)
+            except:
+                stderr.write("Error: --modify-window argument '{}' is not numeric.\n".format(args.modify_window))
+                exit(1)
+        dbpath = None
+        if args.path is not None:
+            dbpath = Path(path_normpath(str(args.path.absolute())))
+        dbfilename = None
+        if args.db is not None:
+            dbfilename = Path(path_normpath(str(args.db.absolute())))  #Path.resolve() would throw exceptions when
+                                                                       #file not found in Python 3.4 (i.e., for 'init').
+        db = HashDatabase(dbpath, dbfilename, args.symlink_mode)
+        if args.dbimport is not None:
+            if db.dbfilename is None:
+                #Default DB filename in case --dbimport was specified but not --db (don't use default with --dbimport):
+                if str(args.dbimport) == "-":
+                    db.dbfilename = Path("stdin_" + DB_FILENAME).absolute()
+                else:
+                    db.dbfilename = Path(path_normpath(str(args.dbimport.absolute()))).parent / (args.dbimport.name + "_" + DB_FILENAME)
+            db.dbimport(args.dbimport)
+        args.func(db, args)
+    except (ImportHashDatabaseError,SaveHashDatabaseError,LoadHashDatabaseError) as e:
+        stderr.write(str(e) + "\n")
+        exit(1)
+    except BrokenPipeError:
+        #This error happens when the user interrupts the output, like when
+        #doing "checksum_db status | head -n5" to only get the first 5 lines.
+        #Return nonzero error level because the program can't finish nor save
+        #(all further calls to stdout will produce an exception).
+        exit(1)
+    except KeyboardInterrupt:
+        print("")  #Leave a newline after the CTRL+C
+        exit(1)
+
