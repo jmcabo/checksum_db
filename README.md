@@ -5,15 +5,15 @@ This is an explanation I gave to a friend on how to use it (in spanish, I'm from
 
 Para crear el checksum del directorio actual y todos sus subdirs:
 
-          *checksum_db init*
+          checksum_db init
 
 Para que agrege los archivos recientemente copiados o agregados a un subdir:
 
-          *checksum_db update*
+          checksum_db update
 
 Para listar los cambios de fecha o de archivos borrados y agregados (sin involucrar el checksumeado):
 
-          *checksum_db status*
+          checksum_db status
 
 Para verificar:      checksum_db verify
 soporta todos estos algoritmos:
